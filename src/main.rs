@@ -1,11 +1,10 @@
 mod ast;
-mod codegen;
-mod riscv;
+mod ir;
+mod asm;
 
 use anyhow::{anyhow, Result};
 use koopa::back::KoopaGenerator;
 use lalrpop_util::lalrpop_mod;
-use riscv::RiscvGenerator;
 use std::fs::{read_to_string, File};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -23,11 +22,11 @@ fn main() -> Result<()> {
     let mut output = File::create(output)?;
 
     let ast = sysy::CompUnitParser::new().parse(&input).unwrap();
-    let program = codegen::codegen(ast);
+    let program = ir::codegen(ast);
 
     match mode {
         Mode::Koopa => KoopaGenerator::new(&mut output).generate_on(&program)?,
-        Mode::Riscv => RiscvGenerator::new(&mut output).generate_on(&program)?,
+        Mode::Riscv => asm::codegen(&mut output, &program)?,
         Mode::Perf => todo!(),
     }
 

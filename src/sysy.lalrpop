@@ -15,15 +15,90 @@ FuncDef: FuncDef = {
   <func_type: FuncType> <ident: Ident> "(" ")" <block: Block> => {
     FuncDef { <> }
   }
-}
+};
 
 FuncType: FuncType = "int" => FuncType::Int;
 
 Block: Block = "{" <stmt: Stmt> "}" => Block { <> };
 
-Stmt: Stmt = "return" <num: Number> ";" => Stmt { <> };
+Stmt: Stmt = "return" <exp: Exp> ";" => Stmt { <> };
 
-Number: i32 = <num: IntConst> => <>;
+Exp: Exp = <exp: LOrExp> => Exp { <> };
+
+PrimaryExp: PrimaryExp = {
+  "(" <Exp> ")" => PrimaryExp::Exp(Box::new(<>)),
+  <Number> => PrimaryExp::Num(<>),
+};
+
+Number: Number = IntConst;
+
+UnaryExp: UnaryExp = {
+  PrimaryExp => UnaryExp::Primary(<>),
+  <op: UnaryOp> <exp: UnaryExp> => UnaryExp::Unary {op, exp: Box::new(exp)},
+};
+
+MulExp: BinaryExp = {
+  UnaryExp => BinaryExp::Single(<>),
+  <lhs: MulExp> <op: MulOp> <rhs: UnaryExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(BinaryExp::Single(rhs))},
+};
+
+AddExp: BinaryExp = {
+  MulExp,
+  <lhs: AddExp> <op: AddOp> <rhs: MulExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+};
+
+RelExp: BinaryExp = {
+  AddExp,
+  <lhs: RelExp> <op: RelOp> <rhs: AddExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+};
+
+EqExp: BinaryExp = {
+  RelExp,
+  <lhs: EqExp> <op: EqOp> <rhs: RelExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+};
+
+LAndExp: BinaryExp = {
+  EqExp,
+  <lhs: LAndExp> <op: LAndOp> <rhs: EqExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+};
+
+LOrExp: BinaryExp = {
+  LAndExp,
+  <lhs: LOrExp> <op: LOrOp> <rhs: LAndExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+};
+
+UnaryOp: UnaryOp = {
+  "+" => UnaryOp::Pos,
+  "-" => UnaryOp::Neg,
+  "!" => UnaryOp::Not,
+};
+
+MulOp: BinaryOp = {
+  "*" => BinaryOp::Mul,
+  "/" => BinaryOp::Div,
+  "%" => BinaryOp::Mod,
+};
+
+AddOp: BinaryOp = {
+  "+" => BinaryOp::Add,
+  "-" => BinaryOp::Sub,
+};
+
+RelOp: BinaryOp = {
+  "<" => BinaryOp::Lt,
+  "<=" => BinaryOp::Le,
+  ">" => BinaryOp::Gt,
+  ">=" => BinaryOp::Ge,
+};
+
+EqOp: BinaryOp = {
+  "==" => BinaryOp::Eq,
+  "!=" => BinaryOp::Ne,
+};
+
+LAndOp: BinaryOp = "&&" => BinaryOp::LAnd;
+
+LOrOp: BinaryOp = "||" => BinaryOp::LOr;
 
 Ident: String = r"[_a-zA-Z][_a-zA-Z0-9]*" => <>.to_string();
 
@@ -31,4 +106,4 @@ IntConst: i32 = {
   r"[1-9][0-9]*" => i32::from_str_radix(<>, 10).unwrap(),
   r"0[0-7]*" => i32::from_str_radix(<>, 8).unwrap(),
   r"0[xX][0-9a-fA-F]+" => i32::from_str_radix(&<>[2..], 16).unwrap(),
-}
+};

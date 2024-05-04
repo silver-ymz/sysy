@@ -22,5 +22,58 @@ pub struct Block {
 
 #[derive(Debug)]
 pub struct Stmt {
-    pub num: i32,
+    pub exp: Exp,
+}
+
+#[derive(Debug)]
+pub struct Exp {
+    pub exp: BinaryExp,
+}
+
+#[derive(Debug)]
+pub enum PrimaryExp {
+    Exp(Box<Exp>),
+    Num(Number),
+}
+
+pub type Number = i32;
+
+#[derive(Debug)]
+pub enum UnaryExp {
+    Primary(PrimaryExp),
+    Unary { op: UnaryOp, exp: Box<UnaryExp> },
+}
+
+#[derive(Debug)]
+pub enum BinaryExp {
+    Single(UnaryExp),
+    Multi {
+        op: BinaryOp,
+        lhs: Box<BinaryExp>,
+        rhs: Box<BinaryExp>,
+    },
+}
+
+#[derive(Debug)]
+pub enum UnaryOp {
+    Pos,
+    Neg,
+    Not,
+}
+
+#[derive(Debug)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    LAnd,
+    LOr,
 }
