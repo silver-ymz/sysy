@@ -1,6 +1,7 @@
 use anyhow::Result;
 use koopa::ir::{
     dfg::DataFlowGraph, layout::BasicBlockNode, BasicBlock, BinaryOp, Function, Program, Value,
+    ValueKind,
 };
 use std::{
     collections::HashMap,
@@ -19,7 +20,7 @@ pub fn codegen<W: Write>(w: &mut W, program: &Program) -> Result<()> {
     .codegen()
 }
 
-struct Context<'a, W: Write> {
+struct Context<'a, W> {
     w: &'a mut W,
     program: &'a Program,
     dfg: Option<&'a DataFlowGraph>,
@@ -49,8 +50,23 @@ impl<'a, W: Write> Context<'a, W> {
         let func = self.program.func(func);
         self.dfg = Some(func.dfg());
         writeln!(self.w, "{}:", &func.name()[1..])?;
+
+        for (&bb, node) in func.layout().bbs() {
+            self.alloc_bb(bb, node)?;
+        }
+
+        self.register_alloc.finish();
+
         for (&bb, node) in func.layout().bbs() {
             self.codegen_bb(bb, node)?;
+        }
+
+        Ok(())
+    }
+
+    fn alloc_bb(&mut self, _: BasicBlock, node: &BasicBlockNode) -> Result<()> {
+        for &inst in node.insts().keys() {
+            self.alloc_value(inst)?;
         }
 
         Ok(())
@@ -64,30 +80,78 @@ impl<'a, W: Write> Context<'a, W> {
         Ok(())
     }
 
-    fn codegen_local_inst(&mut self, inst: Value) -> Result<()> {
+    fn alloc_value(&mut self, inst: Value) -> Result<ValueAddr> {
         use koopa::ir::ValueKind::*;
         let data = self.dfg().value(inst);
         match data.kind() {
-            Integer(v) => {
-                if v.value() == 0 {
-                    self.register_alloc.set_x0(inst);
-                    return Ok(());
-                }
-                let addr = self.register_alloc.get(inst);
-                let ValueAddr::Register(reg) = addr else {
-                    todo!()
-                };
-                writeln!(self.w, "  li {}, {}", reg.to_str(), v.value())?;
-            }
+            Integer(_) => Ok(ValueAddr::Register(Register::ZERO)),
             ZeroInit(_) => todo!(),
             Undef(_) => todo!(),
             Aggregate(_) => todo!(),
             FuncArgRef(_) => todo!(),
             BlockArgRef(_) => todo!(),
-            Alloc(_) => todo!(),
+            Alloc(_) => Ok(self.register_alloc.set(inst)),
             GlobalAlloc(_) => todo!(),
-            Load(_) => todo!(),
-            Store(_) => todo!(),
+            Load(_) => Ok(self.register_alloc.set(inst)),
+            Store(v) => {
+                let value_data = self.dfg().value(v.value());
+                if !value_data.kind().is_const() {
+                    let addr = self.register_alloc.set(v.value());
+                    self.register_alloc.free(addr);
+                }
+                Ok(ValueAddr::Register(Register::ZERO))
+            }
+            GetPtr(_) => todo!(),
+            GetElemPtr(_) => todo!(),
+            Binary(_) => self.alloc_binary(inst),
+            Branch(_) => todo!(),
+            Jump(_) => todo!(),
+            Call(_) => todo!(),
+            Return(v) => {
+                if let Some(v) = v.value() {
+                    let _ = self.alloc_value(v);
+                }
+                Ok(ValueAddr::Register(Register::ZERO))
+            }
+        }
+    }
+
+    fn codegen_local_inst(&mut self, inst: Value) -> Result<()> {
+        use koopa::ir::ValueKind::*;
+        let data = self.dfg().value(inst);
+        match data.kind() {
+            Integer(_) => unreachable!(),
+            ZeroInit(_) => todo!(),
+            Undef(_) => todo!(),
+            Aggregate(_) => todo!(),
+            FuncArgRef(_) => todo!(),
+            BlockArgRef(_) => todo!(),
+            Alloc(_) => {}
+            GlobalAlloc(_) => todo!(),
+            Load(v) => {
+                let src = self.register_alloc.get(v.src());
+                let dst = self.register_alloc.get(inst);
+                self.mov(src, dst)?;
+            }
+            Store(v) => {
+                let value_data = self.dfg().value(v.value());
+                if let ValueKind::Integer(num) = value_data.kind() {
+                    match self.register_alloc.get(v.dest()) {
+                        ValueAddr::Register(reg) => {
+                            writeln!(self.w, "  li {}, {}", reg.to_str(), num.value())?;
+                        }
+                        ValueAddr::Stack(offset) => {
+                            writeln!(self.w, "  li a0, {}", num.value())?;
+                            writeln!(self.w, "  sw a0, {}(sp)", offset)?;
+                        }
+                    }
+                    return Ok(());
+                }
+
+                let src = self.register_alloc.get(v.value());
+                let dst = self.register_alloc.get(v.dest());
+                self.mov(src, dst)?;
+            }
             GetPtr(_) => todo!(),
             GetElemPtr(_) => todo!(),
             Binary(_) => self.codegen_binary(inst)?,
@@ -96,13 +160,7 @@ impl<'a, W: Write> Context<'a, W> {
             Call(_) => todo!(),
             Return(v) => {
                 if let Some(v) = v.value() {
-                    if !self.register_alloc.exist(v) {
-                        self.codegen_local_inst(v)?;
-                    }
-                    let addr = self.register_alloc.get(v);
-                    let ValueAddr::Register(reg) = addr else {
-                        todo!()
-                    };
+                    let reg = self.load(v, Register::A0)?;
                     if reg != Register::A0 {
                         writeln!(self.w, "  mv a0, {}", reg.to_str())?;
                     }
@@ -114,35 +172,32 @@ impl<'a, W: Write> Context<'a, W> {
         Ok(())
     }
 
+    fn alloc_binary(&mut self, inst: Value) -> Result<ValueAddr> {
+        let data = self.dfg().value(inst);
+        let koopa::ir::ValueKind::Binary(v) = data.kind() else {
+            unreachable!()
+        };
+        let lhs = self.alloc_value(v.lhs())?;
+        let rhs = self.alloc_value(v.rhs())?;
+        let v = self.register_alloc.set(inst);
+        self.register_alloc.free(lhs);
+        self.register_alloc.free(rhs);
+
+        Ok(v)
+    }
+
     fn codegen_binary(&mut self, inst: Value) -> Result<()> {
         let data = self.dfg().value(inst);
         let koopa::ir::ValueKind::Binary(v) = data.kind() else {
             unreachable!()
         };
         let addr = self.register_alloc.get(inst);
-        let ValueAddr::Register(reg) = addr else {
-            todo!()
-        };
-        if !self.register_alloc.exist(v.lhs()) {
-            self.codegen_local_inst(v.lhs())?;
-        }
-        let lhs = self.register_alloc.get(v.lhs());
-        let lhs = match lhs {
+        let reg = match addr {
             ValueAddr::Register(reg) => reg,
-            ValueAddr::Stack(_) => {
-                todo!()
-            }
+            ValueAddr::Stack(_) => Register::A2,
         };
-        if !self.register_alloc.exist(v.rhs()) {
-            self.codegen_local_inst(v.rhs())?;
-        }
-        let rhs = self.register_alloc.get(v.rhs());
-        let rhs = match rhs {
-            ValueAddr::Register(reg) => reg,
-            ValueAddr::Stack(_) => {
-                todo!()
-            }
-        };
+        let lhs = self.load(v.lhs(), Register::A0)?;
+        let rhs = self.load(v.rhs(), Register::A1)?;
 
         match v.op() {
             BinaryOp::Add => {
@@ -269,13 +324,66 @@ impl<'a, W: Write> Context<'a, W> {
             _ => todo!(),
         }
 
+        if let ValueAddr::Stack(offset) = addr {
+            writeln!(self.w, "  sw {}, {}(sp)", reg.to_str(), offset)?;
+        }
+
+        Ok(())
+    }
+
+    fn load(&mut self, value: Value, fallback: Register) -> Result<Register> {
+        let data = self.dfg().value(value);
+        if let ValueKind::Integer(v) = data.kind() {
+            if v.value() == 0 {
+                return Ok(Register::ZERO);
+            }
+            writeln!(self.w, "  li {}, {}", fallback.to_str(), v.value())?;
+            return Ok(fallback);
+        }
+
+        match self.register_alloc.get(value) {
+            ValueAddr::Register(reg) => Ok(reg),
+            ValueAddr::Stack(offset) => {
+                writeln!(self.w, "  lw {}, {}(sp)", fallback.to_str(), offset)?;
+                Ok(fallback)
+            }
+        }
+    }
+
+    fn mov(&mut self, src: ValueAddr, dst: ValueAddr) -> Result<()> {
+        match (src, dst) {
+            (ValueAddr::Register(src), ValueAddr::Register(dst)) => {
+                writeln!(self.w, "  mv {}, {}", dst.to_str(), src.to_str())?;
+            }
+            (ValueAddr::Stack(src), ValueAddr::Register(dst)) => {
+                writeln!(self.w, "  lw {}, {}(sp)", dst.to_str(), src)?;
+            }
+            (ValueAddr::Register(src), ValueAddr::Stack(dst)) => {
+                writeln!(self.w, "  sw {}, {}(sp)", src.to_str(), dst)?;
+            }
+            (ValueAddr::Stack(src), ValueAddr::Stack(dst)) => {
+                writeln!(self.w, "  lw a0, {}(sp)", src)?;
+                writeln!(self.w, "  sw a0, {}(sp)", dst)?;
+            }
+        }
+
         Ok(())
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Register {
-    X0,
+    ZERO = 0,
+    RA,
+    SP,
+    GP,
+    TP,
+    T0,
+    T1,
+    T2,
+    FP,
+    S1,
     A0,
     A1,
     A2,
@@ -284,9 +392,16 @@ enum Register {
     A5,
     A6,
     A7,
-    T0,
-    T1,
-    T2,
+    S2,
+    S3,
+    S4,
+    S5,
+    S6,
+    S7,
+    S8,
+    S9,
+    S10,
+    S11,
     T3,
     T4,
     T5,
@@ -296,7 +411,16 @@ enum Register {
 impl Register {
     fn to_str(self) -> &'static str {
         match self {
-            Register::X0 => "x0",
+            Register::ZERO => "x0",
+            Register::RA => "ra",
+            Register::SP => "sp",
+            Register::GP => "gp",
+            Register::TP => "tp",
+            Register::T0 => "t0",
+            Register::T1 => "t1",
+            Register::T2 => "t2",
+            Register::FP => "s0",
+            Register::S1 => "s1",
             Register::A0 => "a0",
             Register::A1 => "a1",
             Register::A2 => "a2",
@@ -305,9 +429,16 @@ impl Register {
             Register::A5 => "a5",
             Register::A6 => "a6",
             Register::A7 => "a7",
-            Register::T0 => "t0",
-            Register::T1 => "t1",
-            Register::T2 => "t2",
+            Register::S2 => "s2",
+            Register::S3 => "s3",
+            Register::S4 => "s4",
+            Register::S5 => "s5",
+            Register::S6 => "s6",
+            Register::S7 => "s7",
+            Register::S8 => "s8",
+            Register::S9 => "s9",
+            Register::S10 => "s10",
+            Register::S11 => "s11",
             Register::T3 => "t3",
             Register::T4 => "t4",
             Register::T5 => "t5",
@@ -322,33 +453,56 @@ impl Display for Register {
     }
 }
 
+const SAVED_REGS: &[Register] = &[
+    Register::S1,
+    Register::S2,
+    Register::S3,
+    Register::S4,
+    Register::S5,
+    Register::S6,
+    Register::S7,
+    Register::S8,
+    Register::S9,
+    Register::S10,
+    Register::S11,
+    Register::A3,
+    Register::A4,
+    Register::A5,
+    Register::A6,
+    Register::A7,
+];
+
 #[derive(Debug, Clone, Copy)]
 enum ValueAddr {
     Register(Register),
-    #[allow(dead_code)]
     Stack(i32),
 }
 
 struct RegisterAllocator {
-    used_cnt: u8,
-    mem_offset: i32,
+    reg_bitmap: u32,
+    stack_offset: i32,
+    avail_stack: Vec<i32>,
     map: HashMap<Value, ValueAddr>,
 }
 
 impl RegisterAllocator {
     fn new() -> Self {
         Self {
-            used_cnt: 0,
-            mem_offset: 0,
+            reg_bitmap: 0,
+            stack_offset: 0,
+            avail_stack: Vec::new(),
             map: HashMap::new(),
         }
     }
 
-    fn exist(&self, value: Value) -> bool {
-        self.map.contains_key(&value)
+    fn get(&self, value: Value) -> ValueAddr {
+        match self.map.get(&value) {
+            Some(&res) => res,
+            None => panic!("Value is not allocated: {:?}", value),
+        }
     }
 
-    fn get(&mut self, value: Value) -> ValueAddr {
+    fn set(&mut self, value: Value) -> ValueAddr {
         if let Some(&res) = self.map.get(&value) {
             return res;
         }
@@ -357,40 +511,42 @@ impl RegisterAllocator {
         res
     }
 
-    fn set_x0(&mut self, value: Value) {
-        self.map.insert(value, ValueAddr::Register(Register::X0));
-    }
-
     fn alloc(&mut self) -> ValueAddr {
         if let Some(reg) = self.alloc_reg() {
             ValueAddr::Register(reg)
+        } else if let Some(offset) = self.avail_stack.pop() {
+            ValueAddr::Stack(offset)
         } else {
-            self.mem_offset -= 4;
-            ValueAddr::Stack(self.mem_offset)
+            self.stack_offset -= 4;
+            ValueAddr::Stack(self.stack_offset)
+        }
+    }
+
+    fn free(&mut self, value: ValueAddr) {
+        match value {
+            ValueAddr::Register(reg) => self.reg_bitmap &= !(1 << reg as u32),
+            ValueAddr::Stack(offset) => {
+                self.avail_stack.push(offset);
+            }
         }
     }
 
     fn alloc_reg(&mut self) -> Option<Register> {
-        let reg = match self.used_cnt {
-            0 => Register::A0,
-            1 => Register::A1,
-            2 => Register::A2,
-            3 => Register::A3,
-            4 => Register::A4,
-            5 => Register::A5,
-            6 => Register::A6,
-            7 => Register::A7,
-            8 => Register::T0,
-            9 => Register::T1,
-            10 => Register::T2,
-            11 => Register::T3,
-            12 => Register::T4,
-            13 => Register::T5,
-            14 => Register::T6,
-            _ => Register::A0,
-        };
-        self.used_cnt = (self.used_cnt + 1) % 15;
-        Some(reg)
+        for &reg in SAVED_REGS {
+            if self.reg_bitmap & (1 << reg as u32) == 0 {
+                self.reg_bitmap |= 1 << reg as u32;
+                return Some(reg);
+            }
+        }
+        None
+    }
+
+    fn finish(&mut self) {
+        for offset in self.map.values_mut() {
+            if let ValueAddr::Stack(offset) = offset {
+                *offset -= self.stack_offset;
+            }
+        }
     }
 }
 
