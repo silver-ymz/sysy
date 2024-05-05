@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use koopa::ir::{
     dfg::DataFlowGraph, layout::BasicBlockNode, BasicBlock, BinaryOp, Function, Program, Value,
     ValueKind,
@@ -30,8 +30,9 @@ struct Context<'a, W> {
 }
 
 impl<'a, W: Write> Context<'a, W> {
-    fn dfg(&self) -> &'a DataFlowGraph {
-        self.dfg.unwrap()
+    fn dfg(&self) -> Result<&'a DataFlowGraph> {
+        self.dfg
+            .ok_or(anyhow::anyhow!("DataFlowGraph is not set in Context"))
     }
 
     fn codegen(&mut self) -> Result<()> {
@@ -101,7 +102,7 @@ impl<'a, W: Write> Context<'a, W> {
 
     fn alloc_local_inst(&mut self, inst: Value) -> Result<ValueAddr> {
         use koopa::ir::ValueKind::*;
-        let data = self.dfg().value(inst);
+        let data = self.dfg()?.value(inst);
         match data.kind() {
             Integer(_) => Ok(ValueAddr::Register(Register::ZERO)),
             ZeroInit(_) => todo!(),
@@ -125,7 +126,7 @@ impl<'a, W: Write> Context<'a, W> {
 
     fn codegen_local_inst(&mut self, inst: Value) -> Result<()> {
         use koopa::ir::ValueKind::*;
-        let data = self.dfg().value(inst);
+        let data = self.dfg()?.value(inst);
         match data.kind() {
             Integer(_) => unreachable!(),
             ZeroInit(_) => todo!(),
@@ -136,14 +137,14 @@ impl<'a, W: Write> Context<'a, W> {
             Alloc(_) => {}
             GlobalAlloc(_) => todo!(),
             Load(v) => {
-                let src = self.register_alloc.get(v.src());
-                let dst = self.register_alloc.get(inst);
+                let src = self.register_alloc.get(v.src())?;
+                let dst = self.register_alloc.get(inst)?;
                 self.mov(src, dst)?;
             }
             Store(v) => {
-                let value_data = self.dfg().value(v.value());
+                let value_data = self.dfg()?.value(v.value());
                 if let ValueKind::Integer(num) = value_data.kind() {
-                    match self.register_alloc.get(v.dest()) {
+                    match self.register_alloc.get(v.dest())? {
                         ValueAddr::Register(reg) => {
                             writeln!(self.w, "  li {}, {}", reg.to_str(), num.value())?;
                         }
@@ -155,8 +156,8 @@ impl<'a, W: Write> Context<'a, W> {
                     return Ok(());
                 }
 
-                let src = self.register_alloc.get(v.value());
-                let dst = self.register_alloc.get(v.dest());
+                let src = self.register_alloc.get(v.value())?;
+                let dst = self.register_alloc.get(v.dest())?;
                 self.mov(src, dst)?;
             }
             GetPtr(_) => todo!(),
@@ -181,11 +182,11 @@ impl<'a, W: Write> Context<'a, W> {
     }
 
     fn codegen_binary(&mut self, inst: Value) -> Result<()> {
-        let data = self.dfg().value(inst);
+        let data = self.dfg()?.value(inst);
         let koopa::ir::ValueKind::Binary(v) = data.kind() else {
             unreachable!()
         };
-        let addr = self.register_alloc.get(inst);
+        let addr = self.register_alloc.get(inst)?;
         let reg = match addr {
             ValueAddr::Register(reg) => reg,
             ValueAddr::Stack(_) => Register::A2,
@@ -326,7 +327,7 @@ impl<'a, W: Write> Context<'a, W> {
     }
 
     fn load(&mut self, value: Value, fallback: Register) -> Result<Register> {
-        let data = self.dfg().value(value);
+        let data = self.dfg()?.value(value);
         if let ValueKind::Integer(v) = data.kind() {
             if v.value() == 0 {
                 return Ok(Register::ZERO);
@@ -335,7 +336,7 @@ impl<'a, W: Write> Context<'a, W> {
             return Ok(fallback);
         }
 
-        match self.register_alloc.get(value) {
+        match self.register_alloc.get(value)? {
             ValueAddr::Register(reg) => Ok(reg),
             ValueAddr::Stack(offset) => {
                 writeln!(self.w, "  lw {}, {}(sp)", fallback.to_str(), offset)?;
@@ -485,11 +486,11 @@ impl RegisterAllocator {
         }
     }
 
-    fn get(&self, value: Value) -> ValueAddr {
-        match self.map.get(&value) {
-            Some(&res) => res,
-            None => panic!("Value is not allocated: {:?}", value),
-        }
+    fn get(&self, value: Value) -> Result<ValueAddr> {
+        self.map
+            .get(&value)
+            .copied()
+            .ok_or(anyhow!("Value is not allocated: {:?}", value))
     }
 
     fn set(&mut self, value: Value) -> ValueAddr {

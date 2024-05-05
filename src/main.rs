@@ -1,6 +1,6 @@
+mod asm;
 mod ast;
 mod ir;
-mod asm;
 
 use anyhow::{anyhow, Result};
 use koopa::back::KoopaGenerator;
@@ -21,8 +21,10 @@ fn main() -> Result<()> {
     let input = read_to_string(input)?;
     let mut output = File::create(output)?;
 
-    let ast = sysy::CompUnitParser::new().parse(&input).unwrap();
-    let program = ir::codegen(ast);
+    let ast = sysy::CompUnitParser::new()
+        .parse(&input)
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let program = ir::codegen(ast)?;
 
     match mode {
         Mode::Koopa => KoopaGenerator::new(&mut output).generate_on(&program)?,
