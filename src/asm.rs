@@ -54,8 +54,9 @@ impl<'a, W: Write> Context<'a, W> {
         for (&bb, node) in func.layout().bbs() {
             self.alloc_bb(bb, node)?;
         }
-
         self.register_alloc.finish();
+
+        self.prologue()?;
 
         for (&bb, node) in func.layout().bbs() {
             self.codegen_bb(bb, node)?;
@@ -64,9 +65,27 @@ impl<'a, W: Write> Context<'a, W> {
         Ok(())
     }
 
+    fn prologue(&mut self) -> Result<()> {
+        writeln!(
+            self.w,
+            "  addi sp, sp, {}",
+            self.register_alloc.stack_offset()
+        )?;
+        Ok(())
+    }
+
+    fn epilogue(&mut self) -> Result<()> {
+        writeln!(
+            self.w,
+            "  addi sp, sp, {}",
+            -self.register_alloc.stack_offset()
+        )?;
+        Ok(())
+    }
+
     fn alloc_bb(&mut self, _: BasicBlock, node: &BasicBlockNode) -> Result<()> {
         for &inst in node.insts().keys() {
-            self.alloc_value(inst)?;
+            self.alloc_local_inst(inst)?;
         }
 
         Ok(())
@@ -80,7 +99,7 @@ impl<'a, W: Write> Context<'a, W> {
         Ok(())
     }
 
-    fn alloc_value(&mut self, inst: Value) -> Result<ValueAddr> {
+    fn alloc_local_inst(&mut self, inst: Value) -> Result<ValueAddr> {
         use koopa::ir::ValueKind::*;
         let data = self.dfg().value(inst);
         match data.kind() {
@@ -93,26 +112,14 @@ impl<'a, W: Write> Context<'a, W> {
             Alloc(_) => Ok(self.register_alloc.set(inst)),
             GlobalAlloc(_) => todo!(),
             Load(_) => Ok(self.register_alloc.set(inst)),
-            Store(v) => {
-                let value_data = self.dfg().value(v.value());
-                if !value_data.kind().is_const() {
-                    let addr = self.register_alloc.set(v.value());
-                    self.register_alloc.free(addr);
-                }
-                Ok(ValueAddr::Register(Register::ZERO))
-            }
+            Store(_) => Ok(ValueAddr::Register(Register::ZERO)),
             GetPtr(_) => todo!(),
             GetElemPtr(_) => todo!(),
-            Binary(_) => self.alloc_binary(inst),
+            Binary(_) => Ok(self.register_alloc.set(inst)),
             Branch(_) => todo!(),
             Jump(_) => todo!(),
             Call(_) => todo!(),
-            Return(v) => {
-                if let Some(v) = v.value() {
-                    let _ = self.alloc_value(v);
-                }
-                Ok(ValueAddr::Register(Register::ZERO))
-            }
+            Return(_) => Ok(ValueAddr::Register(Register::ZERO)),
         }
     }
 
@@ -165,25 +172,12 @@ impl<'a, W: Write> Context<'a, W> {
                         writeln!(self.w, "  mv a0, {}", reg.to_str())?;
                     }
                 }
+                self.epilogue()?;
                 writeln!(self.w, "  ret")?
             }
         }
 
         Ok(())
-    }
-
-    fn alloc_binary(&mut self, inst: Value) -> Result<ValueAddr> {
-        let data = self.dfg().value(inst);
-        let koopa::ir::ValueKind::Binary(v) = data.kind() else {
-            unreachable!()
-        };
-        let lhs = self.alloc_value(v.lhs())?;
-        let rhs = self.alloc_value(v.rhs())?;
-        let v = self.register_alloc.set(inst);
-        self.register_alloc.free(lhs);
-        self.register_alloc.free(rhs);
-
-        Ok(v)
     }
 
     fn codegen_binary(&mut self, inst: Value) -> Result<()> {
@@ -453,18 +447,14 @@ impl Display for Register {
     }
 }
 
-const SAVED_REGS: &[Register] = &[
-    Register::S1,
-    Register::S2,
-    Register::S3,
-    Register::S4,
-    Register::S5,
-    Register::S6,
-    Register::S7,
-    Register::S8,
-    Register::S9,
-    Register::S10,
-    Register::S11,
+const TEMP_REGS: &[Register] = &[
+    Register::T0,
+    Register::T1,
+    Register::T2,
+    Register::T3,
+    Register::T4,
+    Register::T5,
+    Register::T6,
     Register::A3,
     Register::A4,
     Register::A5,
@@ -522,6 +512,7 @@ impl RegisterAllocator {
         }
     }
 
+    #[allow(dead_code)]
     fn free(&mut self, value: ValueAddr) {
         match value {
             ValueAddr::Register(reg) => self.reg_bitmap &= !(1 << reg as u32),
@@ -532,7 +523,7 @@ impl RegisterAllocator {
     }
 
     fn alloc_reg(&mut self) -> Option<Register> {
-        for &reg in SAVED_REGS {
+        for &reg in TEMP_REGS {
             if self.reg_bitmap & (1 << reg as u32) == 0 {
                 self.reg_bitmap |= 1 << reg as u32;
                 return Some(reg);
@@ -542,11 +533,16 @@ impl RegisterAllocator {
     }
 
     fn finish(&mut self) {
+        self.stack_offset = (self.stack_offset - 15) & !0xf;
         for offset in self.map.values_mut() {
             if let ValueAddr::Stack(offset) = offset {
                 *offset -= self.stack_offset;
             }
         }
+    }
+
+    fn stack_offset(&self) -> i32 {
+        self.stack_offset
     }
 }
 
