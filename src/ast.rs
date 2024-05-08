@@ -63,10 +63,18 @@ pub enum BlockItem {
 
 #[derive(Debug)]
 pub enum Stmt {
-    Assign { lval: LVal, exp: Exp },
+    Assign {
+        lval: LVal,
+        exp: Exp,
+    },
     Exp(Option<Exp>),
     Block(Block),
     Ret(Option<Exp>),
+    IfElse {
+        cond: Exp,
+        then: Box<Stmt>,
+        else_: Option<Box<Stmt>>,
+    },
 }
 
 #[derive(Debug)]

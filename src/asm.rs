@@ -25,7 +25,6 @@ struct Context<'a, W> {
     program: &'a Program,
     dfg: Option<&'a DataFlowGraph>,
     register_alloc: RegisterAllocator,
-    #[allow(dead_code)]
     nm: NameManager,
 }
 
@@ -84,7 +83,8 @@ impl<'a, W: Write> Context<'a, W> {
         Ok(())
     }
 
-    fn alloc_bb(&mut self, _: BasicBlock, node: &BasicBlockNode) -> Result<()> {
+    fn alloc_bb(&mut self, bb: BasicBlock, node: &BasicBlockNode) -> Result<()> {
+        self.nm.alloc(bb);
         for &inst in node.insts().keys() {
             self.alloc_local_inst(inst)?;
         }
@@ -92,7 +92,8 @@ impl<'a, W: Write> Context<'a, W> {
         Ok(())
     }
 
-    fn codegen_bb(&mut self, _: BasicBlock, node: &BasicBlockNode) -> Result<()> {
+    fn codegen_bb(&mut self, bb: BasicBlock, node: &BasicBlockNode) -> Result<()> {
+        writeln!(self.w, "{}:", self.nm.get(bb)?)?;
         for &inst in node.insts().keys() {
             self.codegen_local_inst(inst)?;
         }
@@ -117,8 +118,8 @@ impl<'a, W: Write> Context<'a, W> {
             GetPtr(_) => todo!(),
             GetElemPtr(_) => todo!(),
             Binary(_) => Ok(self.register_alloc.set(inst)),
-            Branch(_) => todo!(),
-            Jump(_) => todo!(),
+            Branch(_) => Ok(ValueAddr::Register(Register::ZERO)),
+            Jump(_) => Ok(ValueAddr::Register(Register::ZERO)),
             Call(_) => todo!(),
             Return(_) => Ok(ValueAddr::Register(Register::ZERO)),
         }
@@ -163,8 +164,22 @@ impl<'a, W: Write> Context<'a, W> {
             GetPtr(_) => todo!(),
             GetElemPtr(_) => todo!(),
             Binary(_) => self.codegen_binary(inst)?,
-            Branch(_) => todo!(),
-            Jump(_) => todo!(),
+            Branch(v) => {
+                if !v.true_args().is_empty() || !v.false_args().is_empty() {
+                    todo!()
+                }
+
+                let cond_val = v.cond();
+                let reg = self.load(cond_val, Register::A0)?;
+                let then_label = self.nm.get(v.true_bb())?;
+                let else_label = self.nm.get(v.false_bb())?;
+                writeln!(self.w, "  bnez {}, {}", reg.to_str(), then_label)?;
+                writeln!(self.w, "  j {}", else_label)?;
+            }
+            Jump(v) => {
+                let label = self.nm.get(v.target())?;
+                writeln!(self.w, "  j {}", label)?;
+            }
             Call(_) => todo!(),
             Return(v) => {
                 if let Some(v) = v.value() {
@@ -548,12 +563,27 @@ impl RegisterAllocator {
 }
 
 struct NameManager {
-    #[allow(dead_code)]
-    global_count: usize,
+    count: usize,
+    map: HashMap<BasicBlock, usize>,
 }
 
 impl NameManager {
     fn new() -> Self {
-        Self { global_count: 0 }
+        Self {
+            count: 0,
+            map: HashMap::new(),
+        }
+    }
+
+    fn alloc(&mut self, bb: BasicBlock) {
+        self.map.insert(bb, self.count);
+        self.count += 1;
+    }
+
+    fn get(&self, bb: BasicBlock) -> Result<String> {
+        match self.map.get(&bb) {
+            Some(&count) => Ok(format!(".L{}", count)),
+            None => Err(anyhow!("BasicBlock is not alloc: {:?}", bb)),
+        }
     }
 }

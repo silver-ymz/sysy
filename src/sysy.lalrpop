@@ -46,15 +46,52 @@ BlockItem: BlockItem = {
 };
 
 Stmt: Stmt = {
+  OpenStmt,
+  ClosedStmt,
+}
+
+OpenStmt: Stmt = {
+  "if" "(" <cond: Exp> ")" <then: Stmt> => Stmt::IfElse { cond, then: Box::new(then), else_: None },
+  "if" "(" <cond: Exp> ")" <then: ClosedStmt> "else" <else_: OpenStmt> => Stmt::IfElse { cond, then: Box::new(then), else_: Some(Box::new(else_)) },
+};
+
+ClosedStmt: Stmt = {
+  SimpleStmt,
+  "if" "(" <cond: Exp> ")" <then: ClosedStmt> "else" <else_: ClosedStmt> => Stmt::IfElse { cond, then: Box::new(then), else_: Some(Box::new(else_)) },
+}
+
+SimpleStmt: Stmt = {
   <lval: LVal> "=" <exp: Exp> ";" => Stmt::Assign { <> },
   <Exp?> ";" => Stmt::Exp(<>),
   <Block> => Stmt::Block(<>),
   "return" <Exp?> ";" => Stmt::Ret(<>),
 };
 
-Exp: Exp = <exp: LOrExp> => Exp { <> };
+Exp: Exp = <exp: BinaryExp> => Exp { <> };
 
 LVal: LVal = <ident: Ident> => LVal { <> };
+
+BinaryExp: BinaryExp = {
+  #[precedence(level="0")]
+  UnaryExp => BinaryExp::Single(<>),
+  #[precedence(level="1")] #[assoc(side="left")]
+  <lhs: BinaryExp> <op: MulOp> <rhs: BinaryExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+  #[precedence(level="2")] #[assoc(side="left")]
+  <lhs: BinaryExp> <op: AddOp> <rhs: BinaryExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+  #[precedence(level="3")] #[assoc(side="left")]
+  <lhs: BinaryExp> <op: RelOp> <rhs: BinaryExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+  #[precedence(level="4")] #[assoc(side="left")]
+  <lhs: BinaryExp> <op: EqOp> <rhs: BinaryExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+  #[precedence(level="5")] #[assoc(side="left")]
+  <lhs: BinaryExp> <op: LAndOp> <rhs: BinaryExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
+  #[precedence(level="6")] #[assoc(side="left")]
+  <lhs: BinaryExp> <op: LOrOp> <rhs: BinaryExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)}
+}
+
+UnaryExp: UnaryExp = {
+  PrimaryExp => UnaryExp::Primary(<>),
+  <op: UnaryOp> <exp: UnaryExp> => UnaryExp::Unary {op, exp: Box::new(exp)},
+};
 
 PrimaryExp: PrimaryExp = {
   "(" <Exp> ")" => PrimaryExp::Exp(Box::new(<>)),
@@ -63,41 +100,6 @@ PrimaryExp: PrimaryExp = {
 };
 
 Number: Number = IntConst;
-
-UnaryExp: UnaryExp = {
-  PrimaryExp => UnaryExp::Primary(<>),
-  <op: UnaryOp> <exp: UnaryExp> => UnaryExp::Unary {op, exp: Box::new(exp)},
-};
-
-MulExp: BinaryExp = {
-  UnaryExp => BinaryExp::Single(<>),
-  <lhs: MulExp> <op: MulOp> <rhs: UnaryExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(BinaryExp::Single(rhs))},
-};
-
-AddExp: BinaryExp = {
-  MulExp,
-  <lhs: AddExp> <op: AddOp> <rhs: MulExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
-};
-
-RelExp: BinaryExp = {
-  AddExp,
-  <lhs: RelExp> <op: RelOp> <rhs: AddExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
-};
-
-EqExp: BinaryExp = {
-  RelExp,
-  <lhs: EqExp> <op: EqOp> <rhs: RelExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
-};
-
-LAndExp: BinaryExp = {
-  EqExp,
-  <lhs: LAndExp> <op: LAndOp> <rhs: EqExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
-};
-
-LOrExp: BinaryExp = {
-  LAndExp,
-  <lhs: LOrExp> <op: LOrOp> <rhs: LAndExp> => BinaryExp::Multi {op, lhs: Box::new(lhs), rhs: Box::new(rhs)},
-};
 
 UnaryOp: UnaryOp = {
   "+" => UnaryOp::Pos,
