@@ -55,14 +55,12 @@ impl<'a> Context<'a> {
         self.layout_mut()?
             .bb_mut(bb)
             .insts_mut()
-            .extend(insts.into_iter().copied());
+            .extend(insts.iter().copied());
         Ok(())
     }
 
     fn add_bbs(&mut self, bbs: &[BasicBlock]) -> Result<()> {
-        self.layout_mut()?
-            .bbs_mut()
-            .extend(bbs.into_iter().copied());
+        self.layout_mut()?.bbs_mut().extend(bbs.iter().copied());
         Ok(())
     }
 
@@ -98,7 +96,7 @@ impl<'a> Context<'a> {
                 .pop_back()
                 .ok_or(anyhow!("no instruction to drop"))?;
         }
-        insts_mut.extend(insts.into_iter());
+        insts_mut.extend(insts);
         self.layout_mut()?.bbs_mut().remove(&current_bb);
 
         Ok(())
@@ -200,10 +198,8 @@ impl<'a> Context<'a> {
     fn codegen_stmt(&mut self, stmt: Stmt) -> Result<bool> {
         let val = match stmt {
             Stmt::Assign { lval, exp } => {
-                let lval = match lval {
-                    LVal { ident } => self.symbol_table.get(&ident)?,
-                };
-                let lval = match lval {
+                let LVal { ident } = lval;
+                let lval = match self.symbol_table.get(&ident)? {
                     Val::Var(v) => v,
                     _ => return Err(anyhow!("assign to const variable")),
                 };
@@ -229,10 +225,10 @@ impl<'a> Context<'a> {
                 true
             }
             Stmt::IfElse { cond, then, else_ } => match else_ {
-                Some(else_) => self.codegen_ifelse(cond, then, else_)?,
-                None => self.codegen_if(cond, then)?,
+                Some(else_) => self.codegen_ifelse(cond, *then, *else_)?,
+                None => self.codegen_if(cond, *then)?,
             },
-            Stmt::While { cond, body } => self.codegen_while(cond, body)?,
+            Stmt::While { cond, body } => self.codegen_while(cond, *body)?,
             Stmt::Break => {
                 let target = self
                     .loop_break
@@ -254,14 +250,14 @@ impl<'a> Context<'a> {
         Ok(val)
     }
 
-    fn codegen_if(&mut self, cond: Exp, then: Box<Stmt>) -> Result<bool> {
+    fn codegen_if(&mut self, cond: Exp, then: Stmt) -> Result<bool> {
         let then_bb = self.new_bb()?;
         let end_bb = self.new_bb()?;
 
         let cond_val = self.codegen_exp(cond)?;
         if let Some(num) = self.take_const(cond_val)? {
             if num != 0 {
-                return self.codegen_stmt(*then);
+                return self.codegen_stmt(then);
             } else {
                 return Ok(false);
             }
@@ -272,7 +268,7 @@ impl<'a> Context<'a> {
         self.add_insts(&[branch_inst])?;
 
         self.bb = Some(then_bb);
-        if !self.codegen_stmt(*then)? {
+        if !self.codegen_stmt(then)? {
             let jump_inst = self.new_value()?.jump(end_bb);
             self.add_insts(&[jump_inst])?;
         }
@@ -281,7 +277,7 @@ impl<'a> Context<'a> {
         Ok(false)
     }
 
-    fn codegen_ifelse(&mut self, cond: Exp, then: Box<Stmt>, else_: Box<Stmt>) -> Result<bool> {
+    fn codegen_ifelse(&mut self, cond: Exp, then: Stmt, else_: Stmt) -> Result<bool> {
         let then_bb = self.new_bb()?;
         let else_bb = self.new_bb()?;
         let end_bb = self.new_bb()?;
@@ -289,9 +285,9 @@ impl<'a> Context<'a> {
         let cond_val = self.codegen_exp(cond)?;
         if let Some(num) = self.take_const(cond_val)? {
             if num != 0 {
-                return self.codegen_stmt(*then);
+                return self.codegen_stmt(then);
             } else {
-                return self.codegen_stmt(*else_);
+                return self.codegen_stmt(else_);
             }
         }
 
@@ -300,13 +296,13 @@ impl<'a> Context<'a> {
         self.add_insts(&[branch_inst])?;
 
         self.bb = Some(then_bb);
-        if !self.codegen_stmt(*then)? {
+        if !self.codegen_stmt(then)? {
             let jump_inst = self.new_value()?.jump(end_bb);
             self.add_insts(&[jump_inst])?;
         }
 
         self.bb = Some(else_bb);
-        if !self.codegen_stmt(*else_)? {
+        if !self.codegen_stmt(else_)? {
             let jump_inst = self.new_value()?.jump(end_bb);
             self.add_insts(&[jump_inst])?;
         }
@@ -315,7 +311,7 @@ impl<'a> Context<'a> {
         Ok(false)
     }
 
-    fn codegen_while(&mut self, cond: Exp, body: Box<Stmt>) -> Result<bool> {
+    fn codegen_while(&mut self, cond: Exp, body: Stmt) -> Result<bool> {
         let cond_bb = self.new_bb()?;
         let body_bb = self.new_bb()?;
         let end_bb = self.new_bb()?;
@@ -336,7 +332,7 @@ impl<'a> Context<'a> {
                 let previous_loop_continue = self.loop_continue;
                 self.loop_break = Some(end_bb);
                 self.loop_continue = Some(cond_bb);
-                if !self.codegen_stmt(*body)? {
+                if !self.codegen_stmt(body)? {
                     let jump_cond = self.new_value()?.jump(cond_bb);
                     self.add_insts(&[jump_cond])?;
                 }
@@ -357,7 +353,7 @@ impl<'a> Context<'a> {
         let previous_loop_continue = self.loop_continue;
         self.loop_break = Some(end_bb);
         self.loop_continue = Some(cond_bb);
-        if !self.codegen_stmt(*body)? {
+        if !self.codegen_stmt(body)? {
             let jump_cond = self.new_value()?.jump(cond_bb);
             self.add_insts(&[jump_cond])?;
         }
@@ -379,8 +375,8 @@ impl<'a> Context<'a> {
             BinaryExp::Single(unary) => self.codegen_unary(unary),
             BinaryExp::Multi { op, lhs, rhs } => {
                 match op {
-                    crate::ast::BinaryOp::LAnd => return self.codegen_land(lhs, rhs),
-                    crate::ast::BinaryOp::LOr => return self.codegen_lor(lhs, rhs),
+                    crate::ast::BinaryOp::LAnd => return self.codegen_land(*lhs, *rhs),
+                    crate::ast::BinaryOp::LOr => return self.codegen_lor(*lhs, *rhs),
                     _ => {}
                 }
 
@@ -428,13 +424,13 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn codegen_land(&mut self, lhs: Box<BinaryExp>, rhs: Box<BinaryExp>) -> Result<Value> {
-        let cond_val = self.codegen_binary(*lhs)?;
+    fn codegen_land(&mut self, lhs: BinaryExp, rhs: BinaryExp) -> Result<Value> {
+        let cond_val = self.codegen_binary(lhs)?;
         if let Some(num) = self.take_const(cond_val)? {
             if num == 0 {
                 return Ok(self.new_value()?.integer(0));
             } else {
-                let val = self.codegen_binary(*rhs)?;
+                let val = self.codegen_binary(rhs)?;
                 if let Some(num) = self.take_const(val)? {
                     return Ok(self.new_value()?.integer((num != 0) as i32));
                 } else {
@@ -455,7 +451,7 @@ impl<'a> Context<'a> {
         self.add_bbs(&[then_bb])?;
         let previous_bb = self.bb()?;
         self.bb = Some(then_bb);
-        let rhs_val = self.codegen_binary(*rhs)?;
+        let rhs_val = self.codegen_binary(rhs)?;
         if let Some(num) = self.take_const(rhs_val)? {
             self.merge_bb(previous_bb, 3)?;
             if num == 0 {
@@ -477,11 +473,11 @@ impl<'a> Context<'a> {
         Ok(res)
     }
 
-    fn codegen_lor(&mut self, lhs: Box<BinaryExp>, rhs: Box<BinaryExp>) -> Result<Value> {
-        let cond_val = self.codegen_binary(*lhs)?;
+    fn codegen_lor(&mut self, lhs: BinaryExp, rhs: BinaryExp) -> Result<Value> {
+        let cond_val = self.codegen_binary(lhs)?;
         if let Some(num) = self.take_const(cond_val)? {
             if num == 0 {
-                let val = self.codegen_binary(*rhs)?;
+                let val = self.codegen_binary(rhs)?;
                 if let Some(num) = self.take_const(val)? {
                     return Ok(self.new_value()?.integer((num != 0) as i32));
                 } else {
@@ -504,13 +500,13 @@ impl<'a> Context<'a> {
         self.add_bbs(&[then_bb])?;
         let previous_bb = self.bb()?;
         self.bb = Some(then_bb);
-        let rhs_val = self.codegen_binary(*rhs)?;
+        let rhs_val = self.codegen_binary(rhs)?;
         if let Some(num) = self.take_const(rhs_val)? {
             self.merge_bb(previous_bb, 3)?;
             if num == 0 {
                 return Ok(cond_val);
             } else {
-                return Ok(self.new_value()?.integer(1 as i32));
+                return Ok(self.new_value()?.integer(1));
             }
         }
         let zero = self.new_value()?.integer(0);

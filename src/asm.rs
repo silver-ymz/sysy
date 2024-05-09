@@ -105,7 +105,7 @@ impl<'a, W: Write> Context<'a, W> {
         use koopa::ir::ValueKind::*;
         let data = self.dfg()?.value(inst);
         match data.kind() {
-            Integer(_) => Ok(ValueAddr::Register(Register::ZERO)),
+            Integer(_) => Ok(ValueAddr::Register(Register::X0)),
             ZeroInit(_) => todo!(),
             Undef(_) => todo!(),
             Aggregate(_) => todo!(),
@@ -114,14 +114,14 @@ impl<'a, W: Write> Context<'a, W> {
             Alloc(_) => Ok(self.register_alloc.set(inst)),
             GlobalAlloc(_) => todo!(),
             Load(_) => Ok(self.register_alloc.set(inst)),
-            Store(_) => Ok(ValueAddr::Register(Register::ZERO)),
+            Store(_) => Ok(ValueAddr::Register(Register::X0)),
             GetPtr(_) => todo!(),
             GetElemPtr(_) => todo!(),
             Binary(_) => Ok(self.register_alloc.set(inst)),
-            Branch(_) => Ok(ValueAddr::Register(Register::ZERO)),
-            Jump(_) => Ok(ValueAddr::Register(Register::ZERO)),
+            Branch(_) => Ok(ValueAddr::Register(Register::X0)),
+            Jump(_) => Ok(ValueAddr::Register(Register::X0)),
             Call(_) => todo!(),
-            Return(_) => Ok(ValueAddr::Register(Register::ZERO)),
+            Return(_) => Ok(ValueAddr::Register(Register::X0)),
         }
     }
 
@@ -345,7 +345,7 @@ impl<'a, W: Write> Context<'a, W> {
         let data = self.dfg()?.value(value);
         if let ValueKind::Integer(v) = data.kind() {
             if v.value() == 0 {
-                return Ok(Register::ZERO);
+                return Ok(Register::X0);
             }
             writeln!(self.w, "  li {}, {}", fallback.to_str(), v.value())?;
             return Ok(fallback);
@@ -384,7 +384,7 @@ impl<'a, W: Write> Context<'a, W> {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Register {
-    ZERO = 0,
+    X0 = 0,
     RA,
     SP,
     GP,
@@ -421,7 +421,7 @@ enum Register {
 impl Register {
     fn to_str(self) -> &'static str {
         match self {
-            Register::ZERO => "x0",
+            Register::X0 => "x0",
             Register::RA => "ra",
             Register::SP => "sp",
             Register::GP => "gp",
