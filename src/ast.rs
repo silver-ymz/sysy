@@ -75,6 +75,12 @@ pub enum Stmt {
         then: Box<Stmt>,
         else_: Option<Box<Stmt>>,
     },
+    While {
+        cond: Exp,
+        body: Box<Stmt>,
+    },
+    Break,
+    Continue,
 }
 
 #[derive(Debug)]

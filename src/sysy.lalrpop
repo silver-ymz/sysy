@@ -53,11 +53,13 @@ Stmt: Stmt = {
 OpenStmt: Stmt = {
   "if" "(" <cond: Exp> ")" <then: Stmt> => Stmt::IfElse { cond, then: Box::new(then), else_: None },
   "if" "(" <cond: Exp> ")" <then: ClosedStmt> "else" <else_: OpenStmt> => Stmt::IfElse { cond, then: Box::new(then), else_: Some(Box::new(else_)) },
+  "while" "(" <cond: Exp> ")" <body: OpenStmt> => Stmt::While { cond, body: Box::new(body) },
 };
 
 ClosedStmt: Stmt = {
   SimpleStmt,
   "if" "(" <cond: Exp> ")" <then: ClosedStmt> "else" <else_: ClosedStmt> => Stmt::IfElse { cond, then: Box::new(then), else_: Some(Box::new(else_)) },
+  "while" "(" <cond: Exp> ")" <body: ClosedStmt> => Stmt::While { cond, body: Box::new(body) },
 }
 
 SimpleStmt: Stmt = {
@@ -65,6 +67,8 @@ SimpleStmt: Stmt = {
   <Exp?> ";" => Stmt::Exp(<>),
   <Block> => Stmt::Block(<>),
   "return" <Exp?> ";" => Stmt::Ret(<>),
+  "break" ";" => Stmt::Break,
+  "continue" ";" => Stmt::Continue,
 };
 
 Exp: Exp = <exp: BinaryExp> => Exp { <> };

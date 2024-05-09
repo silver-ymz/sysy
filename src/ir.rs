@@ -14,6 +14,8 @@ pub fn codegen(unit: CompUnit) -> Result<Program> {
         program: &mut program,
         func: None,
         bb: None,
+        loop_continue: None,
+        loop_break: None,
         symbol_table: ScopeSymbolTable::new(),
     }
     .codegen(unit)?;
@@ -24,6 +26,8 @@ struct Context<'a> {
     program: &'a mut Program,
     func: Option<Function>,
     bb: Option<BasicBlock>,
+    loop_continue: Option<BasicBlock>,
+    loop_break: Option<BasicBlock>,
     symbol_table: ScopeSymbolTable,
 }
 
@@ -76,6 +80,28 @@ impl<'a> Context<'a> {
             _ => None,
         };
         Ok(res)
+    }
+
+    fn merge_bb(&mut self, previous_bb: BasicBlock, drop_insts: usize) -> Result<()> {
+        let current_bb = self.bb()?;
+        self.bb = Some(previous_bb);
+        let insts = self
+            .layout_mut()?
+            .bb_mut(current_bb)
+            .insts()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let insts_mut = self.layout_mut()?.bb_mut(previous_bb).insts_mut();
+        for _ in 0..drop_insts {
+            let _ = insts_mut
+                .pop_back()
+                .ok_or(anyhow!("no instruction to drop"))?;
+        }
+        insts_mut.extend(insts.into_iter());
+        self.layout_mut()?.bbs_mut().remove(&current_bb);
+
+        Ok(())
     }
 
     fn codegen(&mut self, unit: CompUnit) -> Result<()> {
@@ -144,9 +170,7 @@ impl<'a> Context<'a> {
             let num = self
                 .take_const(num)?
                 .ok_or(anyhow!("non-constant expression: {}", ident))?;
-            if !self.symbol_table.insert(ident.clone(), Val::Const(num))? {
-                return Err(anyhow!("redefinition of constant: {}", ident));
-            }
+            self.symbol_table.insert(ident.clone(), Val::Const(num))?;
         }
 
         Ok(())
@@ -167,9 +191,7 @@ impl<'a> Context<'a> {
                 let store = self.new_value()?.store(val, var);
                 self.add_insts(&[store])?;
             }
-            if !self.symbol_table.insert(ident.clone(), Val::Var(var))? {
-                return Err(anyhow!("redefinition of variable: {}", ident));
-            }
+            self.symbol_table.insert(ident.clone(), Val::Var(var))?;
         }
 
         Ok(())
@@ -210,6 +232,23 @@ impl<'a> Context<'a> {
                 Some(else_) => self.codegen_ifelse(cond, then, else_)?,
                 None => self.codegen_if(cond, then)?,
             },
+            Stmt::While { cond, body } => self.codegen_while(cond, body)?,
+            Stmt::Break => {
+                let target = self
+                    .loop_break
+                    .ok_or(anyhow!("break statement outside loop"))?;
+                let jump = self.new_value()?.jump(target);
+                self.add_insts(&[jump])?;
+                true
+            }
+            Stmt::Continue => {
+                let target = self
+                    .loop_continue
+                    .ok_or(anyhow!("continue statement outside loop"))?;
+                let jump = self.new_value()?.jump(target);
+                self.add_insts(&[jump])?;
+                true
+            }
         };
 
         Ok(val)
@@ -273,6 +312,60 @@ impl<'a> Context<'a> {
         }
 
         self.bb = Some(end_bb);
+        Ok(false)
+    }
+
+    fn codegen_while(&mut self, cond: Exp, body: Box<Stmt>) -> Result<bool> {
+        let cond_bb = self.new_bb()?;
+        let body_bb = self.new_bb()?;
+        let end_bb = self.new_bb()?;
+
+        let jump_cond = self.new_value()?.jump(cond_bb);
+        self.add_insts(&[jump_cond])?;
+
+        let previous_bb = self.bb()?;
+        self.add_bbs(&[cond_bb])?;
+        self.bb = Some(cond_bb);
+        let cond_val = self.codegen_exp(cond)?;
+        if let Some(num) = self.take_const(cond_val)? {
+            if num == 0 {
+                self.merge_bb(previous_bb, 1)?;
+                return Ok(false);
+            } else {
+                let previous_loop_break = self.loop_break;
+                let previous_loop_continue = self.loop_continue;
+                self.loop_break = Some(end_bb);
+                self.loop_continue = Some(cond_bb);
+                if !self.codegen_stmt(*body)? {
+                    let jump_cond = self.new_value()?.jump(cond_bb);
+                    self.add_insts(&[jump_cond])?;
+                }
+                self.add_bbs(&[end_bb])?;
+                self.bb = Some(end_bb);
+                self.loop_break = previous_loop_break;
+                self.loop_continue = previous_loop_continue;
+                return Ok(false);
+            }
+        }
+
+        let branch_inst = self.new_value()?.branch(cond_val, body_bb, end_bb);
+        self.add_insts(&[branch_inst])?;
+
+        self.add_bbs(&[body_bb])?;
+        self.bb = Some(body_bb);
+        let previous_loop_break = self.loop_break;
+        let previous_loop_continue = self.loop_continue;
+        self.loop_break = Some(end_bb);
+        self.loop_continue = Some(cond_bb);
+        if !self.codegen_stmt(*body)? {
+            let jump_cond = self.new_value()?.jump(cond_bb);
+            self.add_insts(&[jump_cond])?;
+        }
+
+        self.add_bbs(&[end_bb])?;
+        self.bb = Some(end_bb);
+        self.loop_break = previous_loop_break;
+        self.loop_continue = previous_loop_continue;
         Ok(false)
     }
 
@@ -364,20 +457,7 @@ impl<'a> Context<'a> {
         self.bb = Some(then_bb);
         let rhs_val = self.codegen_binary(*rhs)?;
         if let Some(num) = self.take_const(rhs_val)? {
-            self.bb = Some(previous_bb);
-            let insts = self
-                .layout_mut()?
-                .bb_mut(then_bb)
-                .insts()
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            let insts_mut = self.layout_mut()?.bb_mut(previous_bb).insts_mut();
-            let _ = insts_mut.pop_back().unwrap();
-            let _ = insts_mut.pop_back().unwrap();
-            let _ = insts_mut.pop_back().unwrap();
-            insts_mut.extend(insts.into_iter());
-            self.layout_mut()?.bbs_mut().remove(&then_bb);
+            self.merge_bb(previous_bb, 3)?;
             if num == 0 {
                 return Ok(self.new_value()?.integer(0));
             } else {
@@ -426,20 +506,7 @@ impl<'a> Context<'a> {
         self.bb = Some(then_bb);
         let rhs_val = self.codegen_binary(*rhs)?;
         if let Some(num) = self.take_const(rhs_val)? {
-            self.bb = Some(previous_bb);
-            let insts = self
-                .layout_mut()?
-                .bb_mut(then_bb)
-                .insts()
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            let insts_mut = self.layout_mut()?.bb_mut(previous_bb).insts_mut();
-            let _ = insts_mut.pop_back().unwrap();
-            let _ = insts_mut.pop_back().unwrap();
-            let _ = insts_mut.pop_back().unwrap();
-            insts_mut.extend(insts.into_iter());
-            self.layout_mut()?.bbs_mut().remove(&then_bb);
+            self.merge_bb(previous_bb, 3)?;
             if num == 0 {
                 return Ok(cond_val);
             } else {
@@ -537,13 +604,15 @@ impl ScopeSymbolTable {
         Ok(())
     }
 
-    fn insert(&mut self, ident: String, val: Val) -> Result<bool> {
+    fn insert(&mut self, ident: String, val: Val) -> Result<()> {
         let current = self
             .tables
             .last_mut()
             .ok_or(anyhow!("no scope to insert"))?;
-        let res = current.insert(ident, val).is_none();
-        Ok(res)
+        if current.insert(ident.clone(), val).is_some() {
+            return Err(anyhow!("redefinition of symbol: {}", ident));
+        }
+        Ok(())
     }
 
     fn get(&self, ident: &str) -> Result<Val> {
