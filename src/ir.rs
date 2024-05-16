@@ -1,12 +1,34 @@
 use crate::ast::*;
 use anyhow::{anyhow, Result};
 use koopa::ir::{
-    builder::{BasicBlockBuilder, LocalBuilder, LocalInstBuilder, ValueBuilder},
+    builder::{BasicBlockBuilder, GlobalInstBuilder, LocalBuilder, LocalInstBuilder, ValueBuilder},
     dfg::DataFlowGraph,
     layout::Layout,
     BasicBlock, BinaryOp, Function, FunctionData, Program, Type, Value, ValueKind,
 };
+use lazy_static::lazy_static;
 use std::collections::HashMap;
+
+lazy_static! {
+    static ref LIB_FUNCS: Vec<(&'static str, Vec<BType>, FuncType)> = vec![
+        ("getint", vec![], FuncType::Int),
+        ("getch", vec![], FuncType::Int),
+        (
+            "getarray",
+            vec![BType::Pointer(Box::new(BType::Int))],
+            FuncType::Int
+        ),
+        ("putint", vec![BType::Int], FuncType::Void),
+        ("putch", vec![BType::Int], FuncType::Void),
+        (
+            "putarray",
+            vec![BType::Int, BType::Pointer(Box::new(BType::Int))],
+            FuncType::Void
+        ),
+        ("starttime", vec![], FuncType::Void),
+        ("stoptime", vec![], FuncType::Void),
+    ];
+}
 
 pub fn codegen(unit: CompUnit) -> Result<Program> {
     let mut program = Program::new();
@@ -17,6 +39,7 @@ pub fn codegen(unit: CompUnit) -> Result<Program> {
         loop_continue: None,
         loop_break: None,
         symbol_table: ScopeSymbolTable::new(),
+        func_table: FuncTable::new(),
     }
     .codegen(unit)?;
     Ok(program)
@@ -24,11 +47,12 @@ pub fn codegen(unit: CompUnit) -> Result<Program> {
 
 struct Context<'a> {
     program: &'a mut Program,
-    func: Option<Function>,
+    func: Option<(Function, Type)>,
     bb: Option<BasicBlock>,
     loop_continue: Option<BasicBlock>,
     loop_break: Option<BasicBlock>,
     symbol_table: ScopeSymbolTable,
+    func_table: FuncTable,
 }
 
 impl<'a> Context<'a> {
@@ -37,7 +61,13 @@ impl<'a> Context<'a> {
     }
 
     fn func_mut(&mut self) -> Result<&mut FunctionData> {
-        let func = self.func.ok_or(anyhow!("Function is not set in Context"))?;
+        let func = self
+            .func
+            .as_ref()
+            .ok_or(anyhow!(
+                "Function is not set in Context. Maybe you called new_value in global scope."
+            ))?
+            .0;
         let res = self.program.func_mut(func);
         Ok(res)
     }
@@ -72,11 +102,27 @@ impl<'a> Context<'a> {
         Ok(self.dfg_mut()?.new_value())
     }
 
+    fn new_const_integer(&mut self, num: i32) -> Result<Value> {
+        if self.func.is_none() {
+            Ok(self.program.new_value().integer(num))
+        } else {
+            Ok(self.new_value()?.integer(num))
+        }
+    }
+
     fn take_const(&mut self, value: Value) -> Result<Option<i32>> {
-        let res = match self.dfg_mut()?.value(value).kind() {
-            ValueKind::Integer(num) => Some(num.value()),
-            _ => None,
+        let res = if self.func.is_none() {
+            match self.program.borrow_value(value).kind() {
+                ValueKind::Integer(num) => Some(num.value()),
+                _ => None,
+            }
+        } else {
+            match self.dfg_mut()?.value(value).kind() {
+                ValueKind::Integer(num) => Some(num.value()),
+                _ => None,
+            }
         };
+
         Ok(res)
     }
 
@@ -103,30 +149,82 @@ impl<'a> Context<'a> {
     }
 
     fn codegen(&mut self, unit: CompUnit) -> Result<()> {
-        self.codegen_func(unit.func_def)
+        for &(func_name, ref params, ref func_type) in LIB_FUNCS.iter() {
+            let ret_ty = map_func_type(func_type);
+            let param_data = params.iter().map(map_btype).collect::<Vec<_>>();
+            let func = self.program.new_func(FunctionData::new_decl(
+                format!("@{}", func_name),
+                param_data,
+                ret_ty,
+            ));
+            if self
+                .func_table
+                .insert(func_name.to_string(), func)
+                .is_some()
+            {
+                return Err(anyhow!("redefinition of function: {}", func_name));
+            }
+        }
+        for item in unit.items {
+            match item {
+                CompUnitItem::Decl(decl) => self.codegen_global_decl(decl)?,
+                CompUnitItem::FuncDef(func) => self.codegen_func(func)?,
+            }
+        }
+        if !self.func_table.contains_key("main") {
+            return Err(anyhow!("no main function"));
+        }
+        Ok(())
     }
 
     fn codegen_func(&mut self, func: FuncDef) -> Result<()> {
         let FuncDef {
             func_type,
             ident: func_name,
+            params,
             block,
         } = func;
 
-        let ret_ty = match func_type {
-            FuncType::Int => Type::get_i32(),
-        };
-        let func =
-            self.program
-                .new_func(FunctionData::new(format!("@{}", func_name), vec![], ret_ty));
-        self.func = Some(func);
+        let ret_ty = map_func_type(&func_type);
+        let param_data = params
+            .iter()
+            .map(|p| (Some(format!("@{}", p.ident)), map_btype(&p.btype)))
+            .collect::<Vec<_>>();
+        let func = self.program.new_func(FunctionData::with_param_names(
+            format!("@{}", func_name),
+            param_data,
+            ret_ty.clone(),
+        ));
+        if self.func_table.insert(func_name.clone(), func).is_some() {
+            return Err(anyhow!("redefinition of function: {}", func_name));
+        }
 
-        let end = self.new_bb()?;
-        self.add_bbs(&[end])?;
-        self.bb = Some(end);
+        self.func = Some((func, ret_ty.clone()));
 
+        let entry = self.new_bb()?;
+        self.add_bbs(&[entry])?;
+        self.bb = Some(entry);
+
+        self.symbol_table.enter_scope();
+        for (i, param) in params.into_iter().enumerate() {
+            let param_value = self.func_mut()?.params()[i];
+            let alloc = self.new_value()?.alloc(map_btype(&param.btype));
+            let store = self.new_value()?.store(param_value, alloc);
+            self.add_insts(&[alloc, store])?;
+            self.symbol_table.insert(param.ident, Val::Var(alloc))?;
+        }
         if !self.codegen_block(block)? {
-            return Err(anyhow!("no return statement in function"));
+            if ret_ty.is_unit() {
+                let ret = self.new_value()?.ret(None);
+                self.add_insts(&[ret])?;
+            } else {
+                return Err(anyhow!("no return statement in function"));
+            }
+        }
+        self.symbol_table.exit_scope()?;
+
+        if func_name == "main" && !ret_ty.is_i32() {
+            return Err(anyhow!("main function must return int"));
         }
 
         Ok(())
@@ -134,7 +232,6 @@ impl<'a> Context<'a> {
 
     fn codegen_block(&mut self, block: Block) -> Result<bool> {
         let mut res = false;
-        self.symbol_table.enter_scope();
         for item in block.items {
             match item {
                 BlockItem::Decl(decl) => self.codegen_decl(decl)?,
@@ -146,9 +243,14 @@ impl<'a> Context<'a> {
                 }
             }
         }
-        self.symbol_table.exit_scope()?;
-
         Ok(res)
+    }
+
+    fn codegen_global_decl(&mut self, decl: Decl) -> Result<()> {
+        match decl {
+            Decl::Const(const_decl) => self.codegen_global_const_decl(const_decl),
+            Decl::Var(var_decl) => self.codegen_global_var_decl(var_decl),
+        }
     }
 
     fn codegen_decl(&mut self, decl: Decl) -> Result<()> {
@@ -158,17 +260,68 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn codegen_const_decl(&mut self, const_decl: ConstDecl) -> Result<()> {
+    fn codegen_global_const_decl(&mut self, const_decl: ConstDecl) -> Result<()> {
         let ConstDecl { btype, defs } = const_decl;
-        assert!(matches!(btype, BType::Int));
+        let ty = map_btype(&btype);
 
         for def in defs {
             let ConstDef { ident, val } = def;
-            let num = self.codegen_exp(val)?;
-            let num = self
-                .take_const(num)?
-                .ok_or(anyhow!("non-constant expression: {}", ident))?;
+            let val = self.codegen_exp(val)?;
+            let val_data = self.program.borrow_value(val);
+            assert_eq!(ty, Type::get_i32());
+            let num = match val_data.kind() {
+                ValueKind::Integer(num) => num.value(),
+                _ => return Err(anyhow!("non-integer constant expression: {}", ident)),
+            };
             self.symbol_table.insert(ident.clone(), Val::Const(num))?;
+        }
+
+        Ok(())
+    }
+
+    fn codegen_const_decl(&mut self, const_decl: ConstDecl) -> Result<()> {
+        let ConstDecl { btype, defs } = const_decl;
+        let ty = map_btype(&btype);
+
+        for def in defs {
+            let ConstDef { ident, val } = def;
+            let val = self.codegen_exp(val)?;
+            let val_data = self.program.borrow_value(val);
+            assert_eq!(ty, Type::get_i32());
+            let num = match val_data.kind() {
+                ValueKind::Integer(num) => num.value(),
+                _ => return Err(anyhow!("non-integer constant expression: {}", ident)),
+            };
+            self.symbol_table.insert(ident.clone(), Val::Const(num))?;
+        }
+
+        Ok(())
+    }
+
+    fn codegen_global_var_decl(&mut self, var_decl: VarDecl) -> Result<()> {
+        let VarDecl { btype, defs } = var_decl;
+        let ty = map_btype(&btype);
+
+        for def in defs {
+            let VarDef { ident, val } = def;
+            let init_val = match val {
+                Some(exp) => {
+                    let val = self.codegen_exp(exp)?;
+                    let val_data = self.program.borrow_value(val);
+                    if !val_data.kind().is_const() {
+                        return Err(anyhow!("non-constant expression: {}", ident));
+                    }
+                    if val_data.ty() != &ty {
+                        return Err(anyhow!("type mismatch for variable: {}", ident));
+                    }
+                    val
+                }
+                None => self.program.new_value().zero_init(ty.clone()),
+            };
+            let var = self.program.new_value().global_alloc(init_val);
+            self.program
+                .set_value_name(var, Some(format!("@{}", ident)));
+            self.symbol_table.insert(ident.clone(), Val::Var(var))?;
         }
 
         Ok(())
@@ -176,9 +329,7 @@ impl<'a> Context<'a> {
 
     fn codegen_var_decl(&mut self, var_decl: VarDecl) -> Result<()> {
         let VarDecl { btype, defs } = var_decl;
-        let ty = match btype {
-            BType::Int => Type::get_i32(),
-        };
+        let ty = map_btype(&btype);
 
         for def in defs {
             let VarDef { ident, val } = def;
@@ -214,11 +365,34 @@ impl<'a> Context<'a> {
                 }
                 false
             }
-            Stmt::Block(block) => self.codegen_block(block)?,
+            Stmt::Block(block) => {
+                self.symbol_table.enter_scope();
+                let res = self.codegen_block(block)?;
+                self.symbol_table.exit_scope()?;
+                res
+            }
             Stmt::Ret(exp) => {
+                let expect_ret_ty = self
+                    .func
+                    .as_ref()
+                    .ok_or(anyhow!("Function is not set in Context"))?
+                    .1
+                    .clone();
                 let ret_val = match exp {
-                    Some(exp) => Some(self.codegen_exp(exp)?),
-                    None => None,
+                    Some(exp) => {
+                        let val = self.codegen_exp(exp)?;
+                        let val_ty = self.dfg_mut()?.value(val).ty();
+                        if expect_ret_ty != *val_ty {
+                            return Err(anyhow!("return type mismatch"));
+                        }
+                        Some(val)
+                    }
+                    None => {
+                        if !expect_ret_ty.is_unit() {
+                            return Err(anyhow!("return type mismatch"));
+                        }
+                        None
+                    }
                 };
                 let ret = self.new_value()?.ret(ret_val);
                 self.add_insts(&[ret])?;
@@ -372,7 +546,7 @@ impl<'a> Context<'a> {
 
     fn codegen_binary(&mut self, exp: BinaryExp) -> Result<Value> {
         match exp {
-            BinaryExp::Single(unary) => self.codegen_unary(unary),
+            BinaryExp::Single(unary) => self.codegen_unary_exp(unary),
             BinaryExp::Multi { op, lhs, rhs } => {
                 match op {
                     crate::ast::BinaryOp::LAnd => return self.codegen_land(*lhs, *rhs),
@@ -399,7 +573,7 @@ impl<'a> Context<'a> {
                             crate::ast::BinaryOp::Ne => (lhs_num != rhs_num) as Number,
                             _ => unreachable!(),
                         };
-                        return Ok(self.new_value()?.integer(res));
+                        return self.new_const_integer(res);
                     }
                 }
 
@@ -523,45 +697,22 @@ impl<'a> Context<'a> {
         Ok(res)
     }
 
-    fn codegen_unary(&mut self, exp: UnaryExp) -> Result<Value> {
-        let res = match exp {
-            UnaryExp::Primary(primary) => self.codegen_primary(primary)?,
-            UnaryExp::Unary { op, exp } => {
-                let val = self.codegen_unary(*exp)?;
-                match op {
-                    UnaryOp::Pos => val,
-                    UnaryOp::Neg => {
-                        if let Some(num) = self.take_const(val)? {
-                            return Ok(self.new_value()?.integer(-num));
-                        }
-                        let zero = self.new_value()?.integer(0);
-                        let neg = self.new_value()?.binary(BinaryOp::Sub, zero, val);
-                        self.add_insts(&[neg])?;
-                        neg
-                    }
-                    UnaryOp::Not => {
-                        if let Some(num) = self.take_const(val)? {
-                            return Ok(self.new_value()?.integer((num == 0) as Number));
-                        }
-                        let zero = self.new_value()?.integer(0);
-                        let not = self.new_value()?.binary(BinaryOp::Eq, zero, val);
-                        self.add_insts(&[not])?;
-                        not
-                    }
-                }
-            }
-        };
-        Ok(res)
+    fn codegen_unary_exp(&mut self, exp: UnaryExp) -> Result<Value> {
+        match exp {
+            UnaryExp::Primary(primary) => self.codegen_primary(primary),
+            UnaryExp::Unary { op, exp } => self.codegen_unary(op, *exp),
+            UnaryExp::Call { ident, args } => self.codegen_call(ident, args),
+        }
     }
 
     fn codegen_primary(&mut self, primary: PrimaryExp) -> Result<Value> {
         let res = match primary {
             PrimaryExp::Exp(exp) => self.codegen_exp(*exp)?,
-            PrimaryExp::Num(num) => self.new_value()?.integer(num),
+            PrimaryExp::Num(num) => self.new_const_integer(num)?,
             PrimaryExp::LVal(lval) => {
                 let ident = lval.ident;
                 match self.symbol_table.get(&ident)? {
-                    Val::Const(num) => self.new_value()?.integer(num),
+                    Val::Const(val) => self.new_const_integer(val)?,
                     Val::Var(var) => {
                         let val = self.new_value()?.load(var);
                         self.add_insts(&[val])?;
@@ -572,15 +723,56 @@ impl<'a> Context<'a> {
         };
         Ok(res)
     }
+
+    fn codegen_unary(&mut self, op: UnaryOp, exp: UnaryExp) -> Result<Value> {
+        let val = self.codegen_unary_exp(exp)?;
+        let res = match op {
+            UnaryOp::Pos => val,
+            UnaryOp::Neg => {
+                if let Some(num) = self.take_const(val)? {
+                    return self.new_const_integer(-num);
+                }
+                let zero = self.new_value()?.integer(0);
+                let neg = self.new_value()?.binary(BinaryOp::Sub, zero, val);
+                self.add_insts(&[neg])?;
+                neg
+            }
+            UnaryOp::Not => {
+                if let Some(num) = self.take_const(val)? {
+                    return self.new_const_integer((num == 0) as Number);
+                }
+                let zero = self.new_value()?.integer(0);
+                let not = self.new_value()?.binary(BinaryOp::Eq, zero, val);
+                self.add_insts(&[not])?;
+                not
+            }
+        };
+        Ok(res)
+    }
+
+    fn codegen_call(&mut self, ident: String, args: Vec<Exp>) -> Result<Value> {
+        let func = *self
+            .func_table
+            .get(&ident)
+            .ok_or(anyhow!("undefined function: {}", ident))?;
+        let args = args
+            .into_iter()
+            .map(|arg| self.codegen_exp(arg))
+            .collect::<Result<Vec<_>>>()?;
+        let call = self.new_value()?.call(func, args);
+        self.add_insts(&[call])?;
+        Ok(call)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
-    Const(Number),
+    Const(i32),
     Var(Value),
 }
 
 type SymbolTable = HashMap<String, Val>;
+type FuncTable = HashMap<String, Function>;
 
 struct ScopeSymbolTable {
     tables: Vec<SymbolTable>,
@@ -588,11 +780,13 @@ struct ScopeSymbolTable {
 
 impl ScopeSymbolTable {
     fn new() -> Self {
-        Self { tables: Vec::new() }
+        Self {
+            tables: vec![SymbolTable::new()],
+        }
     }
 
     fn enter_scope(&mut self) {
-        self.tables.push(HashMap::new());
+        self.tables.push(SymbolTable::new());
     }
 
     fn exit_scope(&mut self) -> Result<()> {
@@ -618,5 +812,19 @@ impl ScopeSymbolTable {
             }
         }
         Err(anyhow!("undefined symbol: {}", ident))
+    }
+}
+
+fn map_btype(btype: &BType) -> Type {
+    match btype {
+        BType::Int => Type::get_i32(),
+        BType::Pointer(ty) => Type::get_pointer(map_btype(ty)),
+    }
+}
+
+fn map_func_type(func_type: &FuncType) -> Type {
+    match func_type {
+        FuncType::Int => Type::get_i32(),
+        FuncType::Void => Type::get_unit(),
     }
 }

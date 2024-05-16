@@ -9,7 +9,12 @@ match {
   _
 }
 
-pub CompUnit: CompUnit = <func_def: FuncDef> => CompUnit { <> };
+pub CompUnit: CompUnit = <items: CompUnitItem*> => CompUnit { <> };
+
+CompUnitItem: CompUnitItem = {
+  Decl => CompUnitItem::Decl(<>),
+  FuncDef => CompUnitItem::FuncDef(<>),
+};
 
 Decl: Decl = {
   ConstDecl => Decl::Const(<>),
@@ -25,24 +30,32 @@ ConstDef: ConstDef = <ident: Ident> "=" <val: ConstExp> => ConstDef { <> };
 
 ConstExp: ConstExp = Exp;
 
-VarDecl: VarDecl = <btype: BType> <def: VarDef> <mut defs: ("," <VarDef>)*> ";" =>
-  VarDecl { btype, defs: { defs.insert(0, def); defs } };
+VarDecl: VarDecl = "int" <def: VarDef> <mut defs: ("," <VarDef>)*> ";" =>
+  VarDecl { btype: BType::Int, defs: { defs.insert(0, def); defs } };
 
 VarDef: VarDef = <ident: Ident> <val: ("=" <Exp>)?> => VarDef { <> };
 
 FuncDef: FuncDef = {
-  <func_type: FuncType> <ident: Ident> "(" ")" <block: Block> => {
-    FuncDef { <> }
+  <header: FuncDefHeader> <params: FuncFParams?> ")" <block: Block> => {
+    let params = params.unwrap_or_default();
+    FuncDef { func_type: header.0, ident: header.1, params, block }
   }
 };
 
-FuncType: FuncType = "int" => FuncType::Int;
+FuncDefHeader: (FuncType, String) = {
+  "int" <ident: Ident> "(" => (FuncType::Int, ident),
+  "void" <ident: Ident> "("=> (FuncType::Void, ident),
+};
+
+FuncFParams: Vec<Param> = <param: FuncFParam> <mut params: ("," <FuncFParam>)*> => { params.insert(0, param); params };
+
+FuncFParam: Param = <btype: BType> <ident: Ident> => Param { <> };
 
 Block: Block = "{" <items: BlockItem*> "}" => Block { <> };
 
 BlockItem: BlockItem = {
-  <Decl> => BlockItem::Decl(<>),
-  <Stmt> => BlockItem::Stmt(<>),
+  Decl => BlockItem::Decl(<>),
+  Stmt => BlockItem::Stmt(<>),
 };
 
 Stmt: Stmt = {
@@ -65,7 +78,7 @@ ClosedStmt: Stmt = {
 SimpleStmt: Stmt = {
   <lval: LVal> "=" <exp: Exp> ";" => Stmt::Assign { <> },
   <Exp?> ";" => Stmt::Exp(<>),
-  <Block> => Stmt::Block(<>),
+  Block => Stmt::Block(<>),
   "return" <Exp?> ";" => Stmt::Ret(<>),
   "break" ";" => Stmt::Break,
   "continue" ";" => Stmt::Continue,
@@ -95,12 +108,18 @@ BinaryExp: BinaryExp = {
 UnaryExp: UnaryExp = {
   PrimaryExp => UnaryExp::Primary(<>),
   <op: UnaryOp> <exp: UnaryExp> => UnaryExp::Unary {op, exp: Box::new(exp)},
+  <ident: Ident> "(" <args: FuncRFParams?> ")" => {
+    let args = args.unwrap_or_default();
+    UnaryExp::Call { <> }
+  }
 };
+
+FuncRFParams: Vec<Exp> = <exp: Exp> <mut exps: ("," <Exp>)*> => { exps.insert(0, exp); exps };
 
 PrimaryExp: PrimaryExp = {
   "(" <Exp> ")" => PrimaryExp::Exp(Box::new(<>)),
-  <Number> => PrimaryExp::Num(<>),
-  <LVal> => PrimaryExp::LVal(<>),
+  Number => PrimaryExp::Num(<>),
+  LVal => PrimaryExp::LVal(<>),
 };
 
 Number: Number = IntConst;

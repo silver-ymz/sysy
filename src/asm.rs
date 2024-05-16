@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Result};
 use koopa::ir::{
-    dfg::DataFlowGraph, layout::BasicBlockNode, BasicBlock, BinaryOp, Function, Program, Value,
-    ValueKind,
+    dfg::DataFlowGraph, layout::BasicBlockNode, BasicBlock, BinaryOp, Function, Program, TypeKind,
+    Value, ValueKind,
 };
 use std::{
     collections::HashMap,
     fmt::{self, Display, Formatter},
     io::Write,
+    rc::Rc,
 };
 
 pub fn codegen<W: Write>(w: &mut W, program: &Program) -> Result<()> {
@@ -14,8 +15,9 @@ pub fn codegen<W: Write>(w: &mut W, program: &Program) -> Result<()> {
         w,
         program,
         dfg: None,
-        register_alloc: RegisterAllocator::new(),
+        register_alloc: Vec::new(),
         nm: NameManager::new(),
+        global_vars: None,
     }
     .codegen()
 }
@@ -24,8 +26,9 @@ struct Context<'a, W> {
     w: &'a mut W,
     program: &'a Program,
     dfg: Option<&'a DataFlowGraph>,
-    register_alloc: RegisterAllocator,
+    register_alloc: Vec<RegisterAllocator>,
     nm: NameManager,
+    global_vars: Option<Rc<HashMap<Value, String>>>,
 }
 
 impl<'a, W: Write> Context<'a, W> {
@@ -34,11 +37,16 @@ impl<'a, W: Write> Context<'a, W> {
             .ok_or(anyhow::anyhow!("DataFlowGraph is not set in Context"))
     }
 
+    fn register_alloc(&mut self) -> Result<&mut RegisterAllocator> {
+        self.register_alloc
+            .last_mut()
+            .ok_or(anyhow!("RegisterAllocator is not set"))
+    }
+
     fn codegen(&mut self) -> Result<()> {
+        self.codegen_global_vars()?;
+
         write!(self.w, "  .text\n  .globl main\n")?;
-
-        // TODO: deal with global insts
-
         for &func in self.program.func_layout() {
             self.codegen_func(func)?;
         }
@@ -46,15 +54,64 @@ impl<'a, W: Write> Context<'a, W> {
         Ok(())
     }
 
+    fn codegen_global_vars(&mut self) -> Result<()> {
+        let mut global_vars = HashMap::new();
+        if !self.program.inst_layout().is_empty() {
+            writeln!(self.w, "  .data")?;
+            let mut nm_count = 0;
+            for &inst in self.program.inst_layout() {
+                let data = self.program.borrow_value(inst);
+                let name = match data.name().as_ref() {
+                    Some(name) => format!(".V{}", &name[1..]),
+                    None => {
+                        let name = format!(".V{}", nm_count);
+                        nm_count += 1;
+                        name
+                    }
+                };
+
+                writeln!(self.w, "  .globl {}", name)?;
+                writeln!(self.w, "{}:", name)?;
+                global_vars.insert(inst, name);
+                let ValueKind::GlobalAlloc(data) = data.kind() else {
+                    return Err(anyhow!("global variable is not GlobalAlloc: {:?}", data));
+                };
+                let data = self.program.borrow_value(data.init());
+                match data.kind() {
+                    ValueKind::Integer(num) => {
+                        writeln!(self.w, "  .word {}", num.value())?;
+                    }
+                    ValueKind::ZeroInit(_) => {
+                        let size = data.ty().size();
+                        writeln!(self.w, "  .zero {}", size)?;
+                    }
+                    other => todo!("global_vars: {:?}", other),
+                }
+            }
+            writeln!(self.w)?;
+        }
+        self.global_vars = Some(Rc::new(global_vars));
+
+        Ok(())
+    }
+
     fn codegen_func(&mut self, func: Function) -> Result<()> {
         let func = self.program.func(func);
+        if func.dfg().bbs().is_empty() {
+            return Ok(());
+        }
+
         self.dfg = Some(func.dfg());
         writeln!(self.w, "{}:", &func.name()[1..])?;
 
+        let global_vars = self.global_vars.as_ref().unwrap().clone();
+        self.register_alloc
+            .push(RegisterAllocator::new(global_vars));
+        self.register_alloc()?.set_params(func.params());
         for (&bb, node) in func.layout().bbs() {
             self.alloc_bb(bb, node)?;
         }
-        self.register_alloc.finish();
+        self.register_alloc()?.finish();
 
         self.prologue()?;
 
@@ -62,24 +119,30 @@ impl<'a, W: Write> Context<'a, W> {
             self.codegen_bb(bb, node)?;
         }
 
+        self.register_alloc.pop();
+
         Ok(())
     }
 
     fn prologue(&mut self) -> Result<()> {
-        writeln!(
-            self.w,
-            "  addi sp, sp, {}",
-            self.register_alloc.stack_offset()
-        )?;
+        if self.register_alloc()?.max_call_alloc.is_some() {
+            writeln!(self.w, "  sw ra, -4(sp)")?;
+        }
+        let stack_offset = self.register_alloc()?.stack_offset();
+        if stack_offset < 0 {
+            writeln!(self.w, "  addi sp, sp, {}", stack_offset)?;
+        }
         Ok(())
     }
 
     fn epilogue(&mut self) -> Result<()> {
-        writeln!(
-            self.w,
-            "  addi sp, sp, {}",
-            -self.register_alloc.stack_offset()
-        )?;
+        let stack_offset = self.register_alloc()?.stack_offset();
+        if stack_offset < 0 {
+            writeln!(self.w, "  addi sp, sp, {}", -stack_offset)?;
+        }
+        if self.register_alloc()?.max_call_alloc.is_some() {
+            writeln!(self.w, "  lw ra, -4(sp)")?;
+        }
         Ok(())
     }
 
@@ -111,16 +174,28 @@ impl<'a, W: Write> Context<'a, W> {
             Aggregate(_) => todo!(),
             FuncArgRef(_) => todo!(),
             BlockArgRef(_) => todo!(),
-            Alloc(_) => Ok(self.register_alloc.set(inst)),
+            Alloc(_) => Ok(self.register_alloc()?.set(inst)),
             GlobalAlloc(_) => todo!(),
-            Load(_) => Ok(self.register_alloc.set(inst)),
+            Load(_) => Ok(self.register_alloc()?.set(inst)),
             Store(_) => Ok(ValueAddr::Register(Register::X0)),
             GetPtr(_) => todo!(),
             GetElemPtr(_) => todo!(),
-            Binary(_) => Ok(self.register_alloc.set(inst)),
+            Binary(_) => Ok(self.register_alloc()?.set(inst)),
             Branch(_) => Ok(ValueAddr::Register(Register::X0)),
             Jump(_) => Ok(ValueAddr::Register(Register::X0)),
-            Call(_) => todo!(),
+            Call(v) => {
+                self.register_alloc()?.alloc_call_args(v.args());
+                let ty = self.program.func(v.callee()).ty();
+                let ret_ty = match ty.kind() {
+                    TypeKind::Function(_, ret) => ret,
+                    _ => unreachable!(),
+                };
+                if ret_ty.is_i32() {
+                    Ok(self.register_alloc()?.set(inst))
+                } else {
+                    Ok(ValueAddr::Register(Register::X0))
+                }
+            }
             Return(_) => Ok(ValueAddr::Register(Register::X0)),
         }
     }
@@ -138,27 +213,20 @@ impl<'a, W: Write> Context<'a, W> {
             Alloc(_) => {}
             GlobalAlloc(_) => todo!(),
             Load(v) => {
-                let src = self.register_alloc.get(v.src())?;
-                let dst = self.register_alloc.get(inst)?;
+                let src = self.register_alloc()?.get(v.src())?;
+                let dst = self.register_alloc()?.get(inst)?;
                 self.mov(src, dst)?;
             }
             Store(v) => {
                 let value_data = self.dfg()?.value(v.value());
                 if let ValueKind::Integer(num) = value_data.kind() {
-                    match self.register_alloc.get(v.dest())? {
-                        ValueAddr::Register(reg) => {
-                            writeln!(self.w, "  li {}, {}", reg.to_str(), num.value())?;
-                        }
-                        ValueAddr::Stack(offset) => {
-                            writeln!(self.w, "  li a0, {}", num.value())?;
-                            writeln!(self.w, "  sw a0, {}(sp)", offset)?;
-                        }
-                    }
+                    let dst = self.register_alloc()?.get(v.dest())?;
+                    self.mov_const(num.value(), dst)?;
                     return Ok(());
                 }
 
-                let src = self.register_alloc.get(v.value())?;
-                let dst = self.register_alloc.get(v.dest())?;
+                let src = self.register_alloc()?.get(v.value())?;
+                let dst = self.register_alloc()?.get(v.dest())?;
                 self.mov(src, dst)?;
             }
             GetPtr(_) => todo!(),
@@ -180,7 +248,38 @@ impl<'a, W: Write> Context<'a, W> {
                 let label = self.nm.get(v.target())?;
                 writeln!(self.w, "  j {}", label)?;
             }
-            Call(_) => todo!(),
+            Call(v) => {
+                for (i, &arg) in v.args().iter().enumerate().rev() {
+                    let addr = match i {
+                        0 => ValueAddr::Register(Register::A0),
+                        1 => ValueAddr::Register(Register::A1),
+                        2 => ValueAddr::Register(Register::A2),
+                        3 => ValueAddr::Register(Register::A3),
+                        4 => ValueAddr::Register(Register::A4),
+                        5 => ValueAddr::Register(Register::A5),
+                        6 => ValueAddr::Register(Register::A6),
+                        7 => ValueAddr::Register(Register::A7),
+                        n => ValueAddr::Stack(4 * (n as i32 - 8)),
+                    };
+                    let arg_data = self.dfg()?.value(arg);
+                    if let ValueKind::Integer(num) = arg_data.kind() {
+                        self.mov_const(num.value(), addr)?;
+                    } else {
+                        let src = self.register_alloc()?.get(arg)?;
+                        self.mov(src, addr)?;
+                    }
+                }
+                let func_data = self.program.func(v.callee());
+                writeln!(self.w, "  call {}", &func_data.name()[1..])?;
+                let ret_ty = match func_data.ty().kind() {
+                    TypeKind::Function(_, ret) => ret,
+                    _ => unreachable!(),
+                };
+                if ret_ty.is_i32() {
+                    let dst = self.register_alloc()?.get(inst)?;
+                    self.mov(ValueAddr::Register(Register::A0), dst)?;
+                }
+            }
             Return(v) => {
                 if let Some(v) = v.value() {
                     let reg = self.load(v, Register::A0)?;
@@ -201,10 +300,10 @@ impl<'a, W: Write> Context<'a, W> {
         let koopa::ir::ValueKind::Binary(v) = data.kind() else {
             unreachable!()
         };
-        let addr = self.register_alloc.get(inst)?;
+        let addr = self.register_alloc()?.get(inst)?;
         let reg = match addr {
             ValueAddr::Register(reg) => reg,
-            ValueAddr::Stack(_) => Register::A2,
+            _ => Register::A2,
         };
         let lhs = self.load(v.lhs(), Register::A0)?;
         let rhs = self.load(v.rhs(), Register::A1)?;
@@ -334,8 +433,15 @@ impl<'a, W: Write> Context<'a, W> {
             _ => todo!(),
         }
 
-        if let ValueAddr::Stack(offset) = addr {
-            writeln!(self.w, "  sw {}, {}(sp)", reg.to_str(), offset)?;
+        match addr {
+            ValueAddr::Register(_) => {}
+            ValueAddr::Stack(offset) => {
+                writeln!(self.w, "  sw {}, {}(sp)", reg.to_str(), offset)?;
+            }
+            ValueAddr::Global(name) => {
+                writeln!(self.w, "  la a0, {}", name)?;
+                writeln!(self.w, "  sw {}, (a0)", reg.to_str())?;
+            }
         }
 
         Ok(())
@@ -351,10 +457,14 @@ impl<'a, W: Write> Context<'a, W> {
             return Ok(fallback);
         }
 
-        match self.register_alloc.get(value)? {
+        match self.register_alloc()?.get(value)? {
             ValueAddr::Register(reg) => Ok(reg),
             ValueAddr::Stack(offset) => {
                 writeln!(self.w, "  lw {}, {}(sp)", fallback.to_str(), offset)?;
+                Ok(fallback)
+            }
+            ValueAddr::Global(name) => {
+                writeln!(self.w, "  lw {}, {}", fallback.to_str(), name)?;
                 Ok(fallback)
             }
         }
@@ -368,12 +478,52 @@ impl<'a, W: Write> Context<'a, W> {
             (ValueAddr::Stack(src), ValueAddr::Register(dst)) => {
                 writeln!(self.w, "  lw {}, {}(sp)", dst.to_str(), src)?;
             }
+            (ValueAddr::Global(name), ValueAddr::Register(dst)) => {
+                writeln!(self.w, "  lw {}, {}", dst.to_str(), name)?;
+            }
             (ValueAddr::Register(src), ValueAddr::Stack(dst)) => {
                 writeln!(self.w, "  sw {}, {}(sp)", src.to_str(), dst)?;
             }
             (ValueAddr::Stack(src), ValueAddr::Stack(dst)) => {
                 writeln!(self.w, "  lw a0, {}(sp)", src)?;
                 writeln!(self.w, "  sw a0, {}(sp)", dst)?;
+            }
+            (ValueAddr::Global(name), ValueAddr::Stack(dst)) => {
+                writeln!(self.w, "  lw a0, {}", name)?;
+                writeln!(self.w, "  sw a0, {}(sp)", dst)?;
+            }
+            (ValueAddr::Register(src), ValueAddr::Global(name)) => {
+                writeln!(self.w, "  la a0, {}", name)?;
+                writeln!(self.w, "  sw {}, (a0)", src.to_str())?;
+            }
+            (ValueAddr::Stack(src), ValueAddr::Global(name)) => {
+                writeln!(self.w, "  lw a0, {}(sp)", src)?;
+                writeln!(self.w, "  la a1, {}", name)?;
+                writeln!(self.w, "  sw a0, (a1)")?;
+            }
+            (ValueAddr::Global(src), ValueAddr::Global(dst)) => {
+                writeln!(self.w, "  lw a0, {}", src)?;
+                writeln!(self.w, "  la a1, {}", dst)?;
+                writeln!(self.w, "  sw a0, (a1)")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn mov_const(&mut self, num: i32, dst: ValueAddr) -> Result<()> {
+        match dst {
+            ValueAddr::Register(reg) => {
+                writeln!(self.w, "  li {}, {}", reg.to_str(), num)?;
+            }
+            ValueAddr::Stack(offset) => {
+                writeln!(self.w, "  li a0, {}", num)?;
+                writeln!(self.w, "  sw a0, {}(sp)", offset)?;
+            }
+            ValueAddr::Global(name) => {
+                writeln!(self.w, "  li a0, {}", num)?;
+                writeln!(self.w, "  la a1, {}", name)?;
+                writeln!(self.w, "  sw a0, (a1)")?;
             }
         }
 
@@ -463,96 +613,89 @@ impl Display for Register {
     }
 }
 
-const TEMP_REGS: &[Register] = &[
-    Register::T0,
-    Register::T1,
-    Register::T2,
-    Register::T3,
-    Register::T4,
-    Register::T5,
-    Register::T6,
-    Register::A3,
-    Register::A4,
-    Register::A5,
-    Register::A6,
-    Register::A7,
-];
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ValueAddr {
     Register(Register),
     Stack(i32),
+    Global(String),
 }
 
 struct RegisterAllocator {
-    reg_bitmap: u32,
     stack_offset: i32,
-    avail_stack: Vec<i32>,
+    max_call_alloc: Option<u32>,
     map: HashMap<Value, ValueAddr>,
+    global_vars: Rc<HashMap<Value, String>>,
 }
 
 impl RegisterAllocator {
-    fn new() -> Self {
+    fn new(global_vars: Rc<HashMap<Value, String>>) -> Self {
         Self {
-            reg_bitmap: 0,
             stack_offset: 0,
-            avail_stack: Vec::new(),
+            max_call_alloc: None,
             map: HashMap::new(),
+            global_vars,
         }
     }
 
     fn get(&self, value: Value) -> Result<ValueAddr> {
-        self.map
-            .get(&value)
-            .copied()
-            .ok_or(anyhow!("Value is not allocated: {:?}", value))
+        if let Some(res) = self.map.get(&value) {
+            return Ok(res.clone());
+        }
+        if let Some(name) = self.global_vars.get(&value) {
+            return Ok(ValueAddr::Global(name.clone()));
+        }
+        Err(anyhow!("Value is not allocated: {:?}", value))
     }
 
     fn set(&mut self, value: Value) -> ValueAddr {
-        if let Some(&res) = self.map.get(&value) {
-            return res;
+        if let Some(res) = self.map.get(&value) {
+            return res.clone();
         }
         let res = self.alloc();
-        self.map.insert(value, res);
+        self.map.insert(value, res.clone());
         res
     }
 
+    fn set_params(&mut self, values: &[Value]) {
+        for (i, &value) in values.iter().enumerate() {
+            let addr = match i {
+                0 => ValueAddr::Register(Register::A0),
+                1 => ValueAddr::Register(Register::A1),
+                2 => ValueAddr::Register(Register::A2),
+                3 => ValueAddr::Register(Register::A3),
+                4 => ValueAddr::Register(Register::A4),
+                5 => ValueAddr::Register(Register::A5),
+                6 => ValueAddr::Register(Register::A6),
+                7 => ValueAddr::Register(Register::A7),
+                n => ValueAddr::Stack(4 * (n as i32 - 8)),
+            };
+            self.map.insert(value, addr);
+        }
+    }
+
+    fn alloc_call_args(&mut self, params: &[Value]) {
+        let len = params.len() as u32;
+        let num = std::cmp::max(len, 8) - 8;
+        match self.max_call_alloc {
+            Some(n) => self.max_call_alloc = Some(std::cmp::max(n, num)),
+            None => self.max_call_alloc = Some(num),
+        }
+    }
+
     fn alloc(&mut self) -> ValueAddr {
-        if let Some(reg) = self.alloc_reg() {
-            ValueAddr::Register(reg)
-        } else if let Some(offset) = self.avail_stack.pop() {
-            ValueAddr::Stack(offset)
-        } else {
-            self.stack_offset -= 4;
-            ValueAddr::Stack(self.stack_offset)
-        }
-    }
-
-    #[allow(dead_code)]
-    fn free(&mut self, value: ValueAddr) {
-        match value {
-            ValueAddr::Register(reg) => self.reg_bitmap &= !(1 << reg as u32),
-            ValueAddr::Stack(offset) => {
-                self.avail_stack.push(offset);
-            }
-        }
-    }
-
-    fn alloc_reg(&mut self) -> Option<Register> {
-        for &reg in TEMP_REGS {
-            if self.reg_bitmap & (1 << reg as u32) == 0 {
-                self.reg_bitmap |= 1 << reg as u32;
-                return Some(reg);
-            }
-        }
-        None
+        self.stack_offset -= 4;
+        ValueAddr::Stack(self.stack_offset)
     }
 
     fn finish(&mut self) {
-        self.stack_offset = (self.stack_offset - 15) & !0xf;
+        let alloc_ra = self.max_call_alloc.is_some() as i32;
+        if let Some(n) = self.max_call_alloc {
+            self.stack_offset -= 4 * (n as i32 + 1);
+        }
+        self.stack_offset &= !0xf;
         for offset in self.map.values_mut() {
             if let ValueAddr::Stack(offset) = offset {
-                *offset -= self.stack_offset;
+                *offset -= self.stack_offset + alloc_ra * 4;
             }
         }
     }
