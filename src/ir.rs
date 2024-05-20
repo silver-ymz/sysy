@@ -4,7 +4,7 @@ use koopa::ir::{
     builder::{BasicBlockBuilder, GlobalInstBuilder, LocalBuilder, LocalInstBuilder, ValueBuilder},
     dfg::DataFlowGraph,
     layout::Layout,
-    BasicBlock, BinaryOp, Function, FunctionData, Program, Type, Value, ValueKind,
+    BasicBlock, BinaryOp, Function, FunctionData, Program, Type, TypeKind, Value, ValueKind,
 };
 use lazy_static::lazy_static;
 use std::collections::HashMap;
@@ -167,7 +167,7 @@ impl<'a> Context<'a> {
         }
         for item in unit.items {
             match item {
-                CompUnitItem::Decl(decl) => self.codegen_global_decl(decl)?,
+                CompUnitItem::Decl(decl) => self.codegen_decl(decl, true)?,
                 CompUnitItem::FuncDef(func) => self.codegen_func(func)?,
             }
         }
@@ -234,7 +234,7 @@ impl<'a> Context<'a> {
         let mut res = false;
         for item in block.items {
             match item {
-                BlockItem::Decl(decl) => self.codegen_decl(decl)?,
+                BlockItem::Decl(decl) => self.codegen_decl(decl, false)?,
                 BlockItem::Stmt(stmt) => {
                     if self.codegen_stmt(stmt)? {
                         res = true;
@@ -246,66 +246,81 @@ impl<'a> Context<'a> {
         Ok(res)
     }
 
-    fn codegen_global_decl(&mut self, decl: Decl) -> Result<()> {
-        match decl {
-            Decl::Const(const_decl) => self.codegen_global_const_decl(const_decl),
-            Decl::Var(var_decl) => self.codegen_global_var_decl(var_decl),
-        }
-    }
-
-    fn codegen_decl(&mut self, decl: Decl) -> Result<()> {
+    fn codegen_decl(&mut self, decl: Decl, global: bool) -> Result<()> {
         match decl {
             Decl::Const(const_decl) => self.codegen_const_decl(const_decl),
-            Decl::Var(var_decl) => self.codegen_var_decl(var_decl),
+            Decl::Var(var_decl) => self.codegen_var_decl(var_decl, global),
         }
-    }
-
-    fn codegen_global_const_decl(&mut self, const_decl: ConstDecl) -> Result<()> {
-        let ConstDecl { btype, defs } = const_decl;
-        let ty = map_btype(&btype);
-
-        for def in defs {
-            let ConstDef { ident, val } = def;
-            let val = self.codegen_exp(val)?;
-            let val_data = self.program.borrow_value(val);
-            assert_eq!(ty, Type::get_i32());
-            let num = match val_data.kind() {
-                ValueKind::Integer(num) => num.value(),
-                _ => return Err(anyhow!("non-integer constant expression: {}", ident)),
-            };
-            self.symbol_table.insert(ident.clone(), Val::Const(num))?;
-        }
-
-        Ok(())
     }
 
     fn codegen_const_decl(&mut self, const_decl: ConstDecl) -> Result<()> {
         let ConstDecl { btype, defs } = const_decl;
         let ty = map_btype(&btype);
+        assert_eq!(ty, Type::get_i32());
 
         for def in defs {
-            let ConstDef { ident, val } = def;
-            let val = self.codegen_exp(val)?;
-            let val_data = self.program.borrow_value(val);
-            assert_eq!(ty, Type::get_i32());
-            let num = match val_data.kind() {
-                ValueKind::Integer(num) => num.value(),
-                _ => return Err(anyhow!("non-integer constant expression: {}", ident)),
+            let ConstDef {
+                ident,
+                array_index,
+                init_val,
+            } = def;
+            let mut ty = ty.clone();
+            if let Some(exp) = array_index {
+                let index = self.codegen_exp(exp)?;
+                let index = self
+                    .take_const(index)?
+                    .ok_or(anyhow!("non-constant expression: {}", ident))?;
+                let index = usize::try_from(index)
+                    .map_err(|_| anyhow!("invalid array index: {}", ident))?;
+                ty = Type::get_array(ty, index);
             };
-            self.symbol_table.insert(ident.clone(), Val::Const(num))?;
+
+            match init_val {
+                ConstInitVal::Exp(exp) => {
+                    let val = self.codegen_exp(exp)?;
+                    let num = self
+                        .take_const(val)?
+                        .ok_or(anyhow!("non-constant expression: {}", ident))?;
+                    if ty != Type::get_i32() {
+                        return Err(anyhow!("type mismatch for const variable: {}", ident));
+                    }
+                    self.symbol_table.insert(ident, Val::ConstInt(num))?;
+                }
+                ConstInitVal::List(list) => {
+                    let array = self.codegen_list_init(ty, list)?;
+                    self.program.new_value().global_alloc(array);
+                    self.symbol_table.insert(ident, Val::ConstArray(array))?;
+                }
+            }
         }
 
         Ok(())
     }
 
-    fn codegen_global_var_decl(&mut self, var_decl: VarDecl) -> Result<()> {
+    fn codegen_var_decl(&mut self, var_decl: VarDecl, global: bool) -> Result<()> {
         let VarDecl { btype, defs } = var_decl;
         let ty = map_btype(&btype);
+        assert_eq!(ty, Type::get_i32());
 
         for def in defs {
-            let VarDef { ident, val } = def;
-            let init_val = match val {
-                Some(exp) => {
+            let VarDef {
+                ident,
+                array_index,
+                init_val,
+            } = def;
+            let mut ty = ty.clone();
+            if let Some(exp) = array_index {
+                let index = self.codegen_exp(exp)?;
+                let index = self
+                    .take_const(index)?
+                    .ok_or_else(|| anyhow!("non-constant expression: {}", ident))?;
+                let index = usize::try_from(index)
+                    .map_err(|_| anyhow!("invalid array index: {}", ident))?;
+                ty = Type::get_array(ty, index);
+            };
+
+            let init = match init_val {
+                Some(InitVal::Exp(exp)) => {
                     let val = self.codegen_exp(exp)?;
                     let val_data = self.program.borrow_value(val);
                     if !val_data.kind().is_const() {
@@ -316,44 +331,62 @@ impl<'a> Context<'a> {
                     }
                     val
                 }
+                Some(InitVal::List(list)) => {
+                    let array = self.codegen_list_init(ty.clone(), list)?;
+                    self.program.new_value().global_alloc(array)
+                }
                 None => self.program.new_value().zero_init(ty.clone()),
             };
-            let var = self.program.new_value().global_alloc(init_val);
-            self.program
-                .set_value_name(var, Some(format!("@{}", ident)));
-            self.symbol_table.insert(ident.clone(), Val::Var(var))?;
+
+            if global {
+                let var = self.program.new_value().global_alloc(init);
+                self.program
+                    .set_value_name(var, Some(format!("@{}", ident)));
+                self.symbol_table.insert(ident, Val::Var(var))?;
+            } else {
+                let var = self.new_value()?.alloc(ty);
+                let store = self.new_value()?.store(init, var);
+                self.add_insts(&[var, store])?;
+                self.dfg_mut()?.set_value_name(var, Some(ident.clone()));
+                self.symbol_table.insert(ident, Val::Var(var))?;
+            }
         }
 
         Ok(())
     }
 
-    fn codegen_var_decl(&mut self, var_decl: VarDecl) -> Result<()> {
-        let VarDecl { btype, defs } = var_decl;
-        let ty = map_btype(&btype);
-
-        for def in defs {
-            let VarDef { ident, val } = def;
-            let var = self.new_value()?.alloc(ty.clone());
-            self.add_insts(&[var])?;
-            if let Some(exp) = val {
-                let val = self.codegen_exp(exp)?;
-                let store = self.new_value()?.store(val, var);
-                self.add_insts(&[store])?;
-            }
-            self.symbol_table.insert(ident.clone(), Val::Var(var))?;
+    fn codegen_list_init(&mut self, _: Type, list: Vec<Exp>) -> Result<Value> {
+        let mut values = Vec::new();
+        for exp in list {
+            let val = self.codegen_exp(exp)?;
+            values.push(val);
         }
-
-        Ok(())
+        let array = self.new_value()?.aggregate(values);
+        Ok(array)
     }
 
     fn codegen_stmt(&mut self, stmt: Stmt) -> Result<bool> {
         let val = match stmt {
             Stmt::Assign { lval, exp } => {
-                let LVal { ident } = lval;
-                let lval = match self.symbol_table.get(&ident)? {
+                let LVal { ident, array_index } = lval;
+                let mut lval = match self.symbol_table.get(&ident)? {
                     Val::Var(v) => v,
                     _ => return Err(anyhow!("assign to const variable")),
                 };
+                if let Some(exp) = array_index {
+                    let lval_ty = self.dfg_mut()?.value(lval).ty();
+                    match lval_ty.kind() {
+                        TypeKind::Array(ty, _) => {
+                            if ty != &Type::get_i32() {
+                                return Err(anyhow!("array index on non-int array: {}", ident));
+                            }
+                        }
+                        _ => return Err(anyhow!("array index on non-array: {}", ident)),
+                    };
+                    let index = self.codegen_exp(*exp)?;
+                    lval = self.new_value()?.get_elem_ptr(lval, index);
+                    self.add_insts(&[lval])?;
+                }
                 let val = self.codegen_exp(exp)?;
                 let store = self.new_value()?.store(val, lval);
                 self.add_insts(&[store])?;
@@ -710,9 +743,24 @@ impl<'a> Context<'a> {
             PrimaryExp::Exp(exp) => self.codegen_exp(*exp)?,
             PrimaryExp::Num(num) => self.new_const_integer(num)?,
             PrimaryExp::LVal(lval) => {
-                let ident = lval.ident;
+                let LVal { ident, array_index } = lval;
                 match self.symbol_table.get(&ident)? {
-                    Val::Const(val) => self.new_const_integer(val)?,
+                    Val::ConstInt(val) => {
+                        if array_index.is_some() {
+                            return Err(anyhow!("array index on const int: {}", ident));
+                        }
+                        self.new_const_integer(val)?
+                    }
+                    Val::ConstArray(array) => {
+                        let Some(exp) = array_index else {
+                            return Err(anyhow!("missing array index: {}", ident));
+                        };
+                        let index = self.codegen_exp(*exp)?;
+                        let elem = self.new_value()?.get_elem_ptr(array, index);
+                        let val = self.new_value()?.load(elem);
+                        self.add_insts(&[elem, val])?;
+                        val
+                    }
                     Val::Var(var) => {
                         let val = self.new_value()?.load(var);
                         self.add_insts(&[val])?;
@@ -767,7 +815,8 @@ impl<'a> Context<'a> {
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
-    Const(i32),
+    ConstInt(i32),
+    ConstArray(Value),
     Var(Value),
 }
 

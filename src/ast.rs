@@ -36,13 +36,23 @@ pub enum BType {
 #[derive(Debug)]
 pub struct ConstDef {
     pub ident: String,
-    pub val: ConstExp,
+    pub array_index: Option<ConstExp>,
+    pub init_val: ConstInitVal,
 }
+
+pub type ConstInitVal = InitVal;
 
 #[derive(Debug)]
 pub struct VarDef {
     pub ident: String,
-    pub val: Option<Exp>,
+    pub array_index: Option<ConstExp>,
+    pub init_val: Option<InitVal>,
+}
+
+#[derive(Debug)]
+pub enum InitVal {
+    Exp(ConstExp),
+    List(Vec<ConstExp>),
 }
 
 #[derive(Debug)]
@@ -108,6 +118,7 @@ pub type ConstExp = Exp;
 #[derive(Debug)]
 pub struct LVal {
     pub ident: String,
+    pub array_index: Option<Box<Exp>>,
 }
 
 #[derive(Debug)]

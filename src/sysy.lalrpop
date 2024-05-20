@@ -26,14 +26,24 @@ ConstDecl: ConstDecl = "const" <btype: BType> <def: ConstDef> <mut defs: ("," <C
 
 BType: BType = "int" => BType::Int;
 
-ConstDef: ConstDef = <ident: Ident> "=" <val: ConstExp> => ConstDef { <> };
+ConstDef: ConstDef = <ident: Ident> <array_index: ("[" <ConstExp> "]")?> "=" <init_val: ConstInitVal> => ConstDef { <> };
+
+ConstInitVal:ConstInitVal = InitVal;
 
 ConstExp: ConstExp = Exp;
 
 VarDecl: VarDecl = "int" <def: VarDef> <mut defs: ("," <VarDef>)*> ";" =>
   VarDecl { btype: BType::Int, defs: { defs.insert(0, def); defs } };
 
-VarDef: VarDef = <ident: Ident> <val: ("=" <Exp>)?> => VarDef { <> };
+VarDef: VarDef = {
+  <ident: Ident> <array_index: ("[" <ConstExp> "]")?> => VarDef { <>, init_val: None },
+  <ident: Ident> <array_index: ("[" <ConstExp> "]")?> "=" <init_val: InitVal> => VarDef { ident, array_index, init_val: Some(init_val) },
+};
+
+InitVal: InitVal = {
+  Exp => InitVal::Exp(<>),
+  "{" <exp: Exp> <mut exps: ("," <Exp>)*> "}" => InitVal::List({ exps.insert(0, exp); exps }),
+};
 
 FuncDef: FuncDef = {
   <header: FuncDefHeader> <params: FuncFParams?> ")" <block: Block> => {
@@ -86,7 +96,7 @@ SimpleStmt: Stmt = {
 
 Exp: Exp = <exp: BinaryExp> => Exp { <> };
 
-LVal: LVal = <ident: Ident> => LVal { <> };
+LVal: LVal = <ident: Ident> <array_index: ("[" <Exp> "]")?> => LVal { ident, array_index: array_index.map(Box::new) };
 
 BinaryExp: BinaryExp = {
   #[precedence(level="0")]
